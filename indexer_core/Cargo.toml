@@ -1,0 +1,20 @@
+[package]
+name = "indexer_core"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "indexer_core"
+path = "src/main.rs"
+
+[dependencies]
+ignore = "0.4"
+rayon = "1.10"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+hex = "0.4"
+
+[profile.release]
+opt-level = 3
+lto = true
