@@ -1,0 +1,9 @@
+.env
+__pycache__/
+*.pyc
+venv/
+.venv/
+*.db
+chroma_db/
+indexer_core/target/
+logs/
