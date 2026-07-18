@@ -30,6 +30,16 @@ class ProviderResponse:
     input_tokens: int = 0
     output_tokens: int = 0
     tool_calls: list = field(default_factory=list)
+    # Post-retrieval complexity score (core/llm_client.py's
+    # score_complexity()) that drove the routing decision for this
+    # response — set by LLMClient._route() in auto mode, AFTER the
+    # provider itself constructs this object (providers have no
+    # visibility into routing, only into answering). None whenever the
+    # scorer never ran: forced-provider calls (--provider X,
+    # --force-local) and cache hits. Added 2026-07-10 for episodic memory
+    # (Section 10) — logging the real score, or an honest None, rather
+    # than guessing.
+    complexity_score: Optional[int] = None
 
 
 class ProviderError(Exception):

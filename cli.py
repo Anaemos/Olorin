@@ -48,6 +48,16 @@ from core import profiling
 
 app = typer.Typer(help="Olorin — local-first engineering assistant.")
 
+# Extensions treated as "code" for Knowledge Capsule grouping (Section
+# 10/13). Deliberately its own allowlist rather than trusting the
+# walker's language field — keeps capsule generation decoupled from
+# chunker.py's internal language-support matrix, which this module has
+# no need to know about.
+_CODE_EXTENSIONS = {
+    ".py", ".rs", ".js", ".ts", ".jsx", ".tsx",
+    ".go", ".java", ".c", ".cpp", ".h", ".hpp", ".rb", ".cs",
+}
+
 # Where the Rust walker binary lands after `cargo build --release`.
 # Matches the standard Cargo output layout; not user-configurable in V1
 # since indexer_core/ is a fixed part of this repo's own layout (as
@@ -92,28 +102,75 @@ def _run_walker(repo_path: str) -> list[dict]:
 def index(path: str = typer.Argument(..., help="Path to the repo to index.")):
     """
     Index a repo: walk -> hash-skip unchanged files -> chunk -> embed -> store.
-    """
-    # Deferred imports: these pull in torch/sentence-transformers/chromadb,
-    # which are slow to import and unnecessary for `ask` or `--help`.
-    from indexer.chunker import chunk_file
-    from indexer.embedder import embed_chunks
-    from indexer.store import get_collection, get_indexed_file_hash, delete_file, upsert_chunks
 
+    Thin wrapper over _index_repo(verbose=True) — the real orchestration
+    now lives there so `ask` can run the exact same pipeline silently as
+    an automatic freshness check (see ask()'s docstring for why).
+    """
     repo_path = os.path.abspath(path)
     if not os.path.isdir(repo_path):
         typer.secho(f"Not a directory: {repo_path}", fg=typer.colors.RED)
         raise typer.Exit(code=1)
 
+    _index_repo(repo_path, verbose=True)
+
+
+def _index_repo(repo_path: str, verbose: bool = True) -> dict:
+    """
+    Core indexing pipeline: walk -> hash-skip unchanged files -> chunk ->
+    embed -> store, plus Knowledge Capsule generation. Extracted out of
+    the `index` command (2026-07-11) so `ask` can run it automatically as
+    a freshness precondition, not just as an explicit separate step —
+    see the design conversation logged in ENGINEERING_JOURNAL.md and
+    OLORIN_PROJECT.md Section 8/13 for why indexing shouldn't be a step
+    the user has to remember to run.
+
+    verbose=False (ask()'s usage) suppresses all the file-by-file/capsule-
+    by-capsule output that verbose=True (the explicit `index` command)
+    prints — the hash-skip logic means most `ask`-triggered calls do
+    genuinely nothing, and printing a wall of "unchanged, skipped" noise
+    on every single question would be worse than the manual-step problem
+    this replaces. Callers decide what to tell the user based on the
+    returned stats instead.
+
+    Returns:
+        dict: {"walked": int, "reindexed": int, "skipped": int,
+        "total_chunks": int, "capsules_generated": int,
+        "capsules_skipped": int, "elapsed": float, "is_first_index": bool}
+    """
+    # Deferred imports: these pull in torch/sentence-transformers/chromadb,
+    # which are slow to import and unnecessary for `ask` or `--help` when
+    # nothing actually needs indexing.
+    from indexer.chunker import chunk_file
+    from indexer.embedder import embed_chunks
+    from indexer.imports import extract_raw_imports, resolve_imports
+    from indexer.store import get_collection, get_indexed_file_hash, delete_file, upsert_chunks
+    from indexer.capsules import generate_module_summary
+    from memory import capsules as capsules_store
+    from memory import import_graph as import_graph_store
+    from core.llm_client import LLMClient
+
     start = time.time()
-    typer.echo(f"Walking {repo_path} ...")
+    if verbose:
+        typer.echo(f"Walking {repo_path} ...")
     files = _run_walker(repo_path)
-    typer.echo(f"Walker found {len(files)} files ({time.time() - start:.2f}s)")
+    if verbose:
+        typer.echo(f"Walker found {len(files)} files ({time.time() - start:.2f}s)")
 
     collection = get_collection(repo_path)
+    is_first_index = collection.count() == 0
 
     skipped = 0
     reindexed = 0
     total_chunks = 0
+
+    # Full repo-relative path set, used purely as an existence check by
+    # indexer/imports.py's resolve_imports() (V3, "why is this file
+    # important?", Section 11) — built once here from the walker's own
+    # output, not a second filesystem scan, so import resolution stays
+    # consistent with whatever the rest of this pipeline already treats
+    # as "the files in this repo."
+    repo_files = {f["path"] for f in files}
 
     for f in files:
         rel_path = f["path"]
@@ -130,7 +187,8 @@ def index(path: str = typer.Argument(..., help="Path to the repo to index.")):
             with open(abs_path, "r", encoding="utf-8", errors="replace") as fh:
                 content = fh.read()
         except OSError as e:
-            typer.secho(f"  skip (read error) {rel_path}: {e}", fg=typer.colors.YELLOW)
+            if verbose:
+                typer.secho(f"  skip (read error) {rel_path}: {e}", fg=typer.colors.YELLOW)
             continue
 
         # Full re-chunk on any change: clear this file's old chunks first
@@ -144,15 +202,94 @@ def index(path: str = typer.Argument(..., help="Path to the repo to index.")):
             c["file_hash"] = file_hash
         chunks = embed_chunks(chunks)
         total_chunks += upsert_chunks(collection, chunks)
+
+        # Import graph (V3, "why is this file important?", Section 11):
+        # mechanical, no LLM call, so it rides along with every
+        # (re)indexed file rather than needing its own hash-tracking
+        # table — see memory/import_graph.py's module docstring for why
+        # that's a deliberate simplification, not a missing feature.
+        # Best-effort: an extraction failure on one file (e.g. a genuine
+        # parse error) shouldn't lose the chunking/embedding work that
+        # already succeeded above for that same file.
+        try:
+            raw_imports = extract_raw_imports(content, language)
+            resolved_imports = resolve_imports(rel_path, raw_imports, language, repo_files)
+            import_graph_store.set_file_imports(repo_path, rel_path, resolved_imports)
+        except Exception as e:
+            if verbose:
+                typer.secho(f"  import graph failed for {rel_path}: {e}", fg=typer.colors.YELLOW)
+
         reindexed += 1
-        typer.echo(f"  indexed {rel_path} ({len(chunks)} chunks)")
+        if verbose:
+            typer.echo(f"  indexed {rel_path} ({len(chunks)} chunks)")
 
     elapsed = time.time() - start
-    typer.secho(
-        f"\nDone in {elapsed:.2f}s — {reindexed} file(s) (re)indexed, "
-        f"{skipped} unchanged file(s) skipped, {total_chunks} chunks written.",
-        fg=typer.colors.GREEN,
-    )
+    if verbose:
+        typer.secho(
+            f"\nDone in {elapsed:.2f}s — {reindexed} file(s) (re)indexed, "
+            f"{skipped} unchanged file(s) skipped, {total_chunks} chunks written.",
+            fg=typer.colors.GREEN,
+        )
+
+    # --- Knowledge Capsules (module-level summaries, Section 10/13) ----
+    # Group every code file (by extension — see _CODE_EXTENSIONS) by its
+    # top-level directory. Loose root-level files (config.py, cli.py)
+    # fall under a synthetic "root" module.
+    modules: dict[str, list[dict]] = {}
+    for f in files:
+        rel_path = f["path"]
+        ext = os.path.splitext(rel_path)[1]
+        if ext not in _CODE_EXTENSIONS:
+            continue
+        module = rel_path.split("/")[0] if "/" in rel_path else "root"
+        modules.setdefault(module, []).append({"path": rel_path, "hash": f["hash"]})
+
+    llm_client = LLMClient()
+    capsules_generated = 0
+    capsules_skipped = 0
+
+    for module, current_files in modules.items():
+        if not capsules_store.needs_regeneration(repo_path, module, current_files):
+            capsules_skipped += 1
+            continue
+
+        file_payloads = []
+        for cf in current_files:
+            abs_path = os.path.join(repo_path, cf["path"])
+            try:
+                with open(abs_path, "r", encoding="utf-8", errors="replace") as fh:
+                    file_payloads.append({"path": cf["path"], "content": fh.read()})
+            except OSError:
+                continue  # unreadable — skip for capsule purposes, same as the main loop's skip-on-read-error handling
+
+        try:
+            summary = generate_module_summary(llm_client, module, file_payloads)
+            capsules_store.upsert_capsule(repo_path, module, summary, current_files)
+            capsules_generated += 1
+            if verbose:
+                typer.echo(f"  capsule: {module} ({len(current_files)} files)")
+        except Exception as e:
+            # Best-effort: a capsule generation failure shouldn't lose the
+            # indexing work that already succeeded above.
+            if verbose:
+                typer.secho(f"  capsule failed for {module}: {e}", fg=typer.colors.YELLOW)
+
+    if verbose:
+        typer.secho(
+            f"Capsules: {capsules_generated} generated, {capsules_skipped} unchanged.",
+            fg=typer.colors.GREEN,
+        )
+
+    return {
+        "walked": len(files),
+        "reindexed": reindexed,
+        "skipped": skipped,
+        "total_chunks": total_chunks,
+        "capsules_generated": capsules_generated,
+        "capsules_skipped": capsules_skipped,
+        "elapsed": time.time() - start,
+        "is_first_index": is_first_index,
+    }
 
 
 @app.command()
@@ -161,7 +298,7 @@ def ask(
     path: str = typer.Option(".", "--path", "-p", help="Repo root to query."),
     provider: str = typer.Option(
         "auto", "--provider",
-        help="Force a specific backend: groq | boromir | faramir | auto.",
+        help="Force a specific backend: groq | cerebras | boromir | faramir | auto.",
     ),
     force_local: bool = typer.Option(
         False, "--force-local", help="Never call the cloud provider (Groq)."
@@ -170,11 +307,28 @@ def ask(
         False, "--profile",
         help="Print a per-stage latency breakdown (V1.5 instrumentation, OLORIN_PROJECT.md Section 11).",
     ),
+    skip_index: bool = typer.Option(
+        False, "--skip-index",
+        help="Skip the automatic index-freshness check (advanced; answers may be stale or ungrounded).",
+    ),
 ):
     """
     Ask Olorin a question about a repo. Thin wrapper around the already-
     proven Agent.run() (core/agent.py) — per Section 7's CLI flags and
     Section 9's ReAct loop.
+
+    Runs the indexing pipeline (_index_repo()) as an automatic precondition
+    before answering, unless --skip-index is passed. This replaced an
+    earlier design where indexing was purely a separate manual step —
+    real product experience shouldn't require a user to think in terms of
+    "have I indexed yet" before they can ask a question about a repo they
+    just pointed Olorin at (design conversation logged 2026-07-11,
+    OLORIN_PROJECT.md Section 8/13). This is NOT a forced full reindex on
+    every call: the hash-skip logic already built into _index_repo() means
+    a call against an unchanged repo does almost no real work (a fast walk
+    + hash comparison, no re-chunking/re-embedding/re-generating anything)
+    — the honest cost only shows up on a genuinely first-time or changed
+    repo, which is real, unavoidable work either way.
     """
     profiling.reset()
 
@@ -193,21 +347,165 @@ def ask(
         typer.secho(f"Not a directory: {repo_path}", fg=typer.colors.RED)
         raise typer.Exit(code=1)
 
+    if not skip_index:
+        from indexer.store import get_collection
+
+        # Peeked at before running so a genuinely first-time index gets an
+        # honest "this will take a moment" message up front, rather than
+        # the user staring at a silent terminal for 30-90s wondering if
+        # something's hung.
+        was_empty = get_collection(repo_path).count() == 0
+        if was_empty:
+            typer.secho(
+                f"First time indexing {repo_path} — this may take a minute...",
+                fg=typer.colors.CYAN,
+            )
+
+        with profiling.span("auto_index_check", top_level=True):
+            stats = _index_repo(repo_path, verbose=False)
+
+        # Only say something if real work actually happened — the common
+        # case (nothing changed) should stay silent, not print freshness-
+        # check noise on every single question.
+        if not was_empty and (stats["reindexed"] > 0 or stats["capsules_generated"] > 0):
+            typer.secho(
+                f"Repo changed since last index: {stats['reindexed']} file(s) "
+                f"updated, {stats['capsules_generated']} capsule(s) "
+                f"regenerated ({stats['elapsed']:.1f}s).",
+                fg=typer.colors.CYAN,
+            )
+
     force_provider = None
     if force_local:
         force_provider = "boromir"
     elif provider != "auto":
         force_provider = provider
 
-    with profiling.span("total_request", top_level=True):
-        agent = Agent(repo_root=repo_path)
-        answer = agent.run(query, force_provider=force_provider)
+    try:
+        with profiling.span("total_request", top_level=True):
+            agent = Agent(repo_root=repo_path)
+            answer = agent.run(query, force_provider=force_provider)
+    except Exception as e:
+        # Safety net for whatever LLMClient._route() couldn't already
+        # recover from itself (Section 13, 2026-07-12 fallback fix) — a
+        # forced local provider failing (e.g. Ollama not running) has no
+        # further automatic fallback to try without contradicting what
+        # the user explicitly asked for, so the honest move is a clean
+        # error, not a raw traceback dump.
+        typer.secho(f"Request failed: {e}", fg=typer.colors.RED)
+        raise typer.Exit(code=1)
 
     typer.echo(answer)
 
     if profile:
         external_total_ms = (time.perf_counter() - _MODULE_START) * 1000
         typer.echo("\n" + profiling.report(external_total_ms=external_total_ms))
+
+
+@app.command()
+def history(
+    path: str = typer.Option(".", "--path", "-p", help="Repo root to show history for."),
+    limit: int = typer.Option(10, "--limit", "-n", help="Max conversations to show."),
+    search: str = typer.Option(None, "--search", "-s", help="Keyword-overlap search instead of most-recent."),
+):
+    """
+    Browse episodic memory (Section 10) for a repo — mainly here so the
+    write path (Agent.run() -> memory/history.py) can be verified live
+    without reaching for a raw sqlite3 shell, and as a quick way to eyeball
+    what search_history's tool would see. Not a V2 checklist item on its
+    own; a thin, low-cost addition on top of memory/history.py, which does
+    the real work.
+    """
+    from memory import history as history_store
+
+    repo_path = os.path.abspath(path)
+
+    if search:
+        records = history_store.search_history(search, repo_path=repo_path, limit=limit)
+    else:
+        records = history_store.get_recent(repo_path=repo_path, limit=limit)
+
+    if not records:
+        typer.echo("No conversations logged for this repo yet.")
+        return
+
+    for r in records:
+        score = r["complexity_score"] if r["complexity_score"] is not None else "n/a"
+        tools = ", ".join(r["tools_used"]) or "none"
+        typer.secho(f"[{r['timestamp']}] backend={r['backend_used']} complexity={score}", fg=typer.colors.CYAN)
+        typer.echo(f"  Q: {r['user_query']}")
+        typer.echo(f"  A: {r['agent_response'][:200]}{'...' if len(r['agent_response']) > 200 else ''}")
+        typer.echo(f"  tools: {tools}\n")
+
+
+@app.command()
+def journal(
+    path: str = typer.Option(".", "--path", "-p", help="Repo root to generate a journal entry for."),
+    date: str = typer.Option(None, "--date", "-d", help="Date to generate, YYYY-MM-DD. Defaults to today."),
+    no_llm: bool = typer.Option(
+        False, "--no-llm",
+        help="Skip the 'Worked on' synthesis (Faramir); use a literal deduplicated query list instead.",
+    ),
+):
+    """
+    Generate (or regenerate) an Engineering Journal entry for a repo from
+    episodic memory (Section 10) — automates what this project's own
+    ENGINEERING_JOURNAL.md has been maintained as by hand all along.
+    Writes to ~/.olorin/journal/<repo_hash>/<date>.md; see
+    memory/journal.py for why journals live outside the indexed repo
+    (same reasoning as ChromaDB's storage location, Section 8).
+
+    Deliberately a separate, explicit command rather than something
+    `ask` triggers automatically on every call, unlike index-on-demand —
+    see memory/journal.py's module docstring for why (regenerating a
+    journal makes a real LLM call every time; a repeat index check does
+    not).
+    """
+    from memory import journal as journal_store
+    from core.llm_client import LLMClient
+
+    repo_path = os.path.abspath(path)
+    llm_client = None if no_llm else LLMClient()
+
+    result_path = journal_store.write_journal(repo_path, date=date, llm_client=llm_client)
+    if result_path is None:
+        target_date = date or time.strftime("%Y-%m-%d")
+        typer.echo(f"No conversations logged for {repo_path} on {target_date} — nothing to write.")
+        return
+
+    typer.secho(f"Journal written: {result_path}", fg=typer.colors.GREEN)
+
+
+@app.command()
+def entities(
+    path: str = typer.Option(".", "--path", "-p", help="Repo root to show entities for."),
+    limit: int = typer.Option(10, "--limit", "-n", help="Max entities to show."),
+    search: str = typer.Option(None, "--search", "-s", help="Keyword-overlap search instead of most-recently-updated."),
+):
+    """
+    Browse entity memory (decisions and concepts extracted from past runs
+    — see memory/entities.py's module docstring for the design) for a
+    repo. Same purpose as the `history` command: lets the write path
+    (Agent._extract_entities() -> memory/entities.py) be verified live
+    without a raw sqlite3 shell, and doubles as a quick way to eyeball
+    what search_entities' tool would see.
+    """
+    from memory import entities as entities_store
+
+    repo_path = os.path.abspath(path)
+
+    if search:
+        records = entities_store.search_entities(search, repo_path=repo_path, limit=limit)
+    else:
+        records = entities_store.get_all_entities(repo_path, limit=limit)
+
+    if not records:
+        typer.echo("No entities remembered for this repo yet.")
+        return
+
+    for e in records:
+        typer.secho(f"[{e['last_updated']}] {e['type']}: {e['name']}", fg=typer.colors.CYAN)
+        typer.echo(f"  {e['description']}\n")
 
 
 if __name__ == "__main__":

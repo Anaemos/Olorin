@@ -99,6 +99,32 @@ def upsert_chunks(collection: chromadb.Collection, chunks: list[dict]) -> int:
         return 0
 
     ids = [_chunk_id(c) for c in chunks]
+
+    # Defense-in-depth (2026-07-12): de-duplicate by ID before handing
+    # off to Chroma, which raises a hard DuplicateIDError and aborts the
+    # WHOLE upsert (including every other legitimate chunk in the batch)
+    # if even one collision slips through. The real fix for the one
+    # collision cause found so far lives in embedder.py's
+    # _split_oversized_chunks() (see its docstring) — this is a backstop
+    # for any future collision cause, not a substitute for fixing root
+    # causes at the layer that produces them. Keeps the LAST occurrence
+    # of a duplicate ID, consistent with upsert semantics (last write
+    # wins) rather than silently preferring whichever happened to sort
+    # first.
+    seen: dict[str, int] = {}
+    for i, cid in enumerate(ids):
+        seen[cid] = i  # later index overwrites earlier ones for the same id
+    if len(seen) < len(ids):
+        import sys
+        print(
+            f"WARNING: {len(ids) - len(seen)} duplicate chunk id(s) "
+            f"collapsed before upsert — see upsert_chunks()'s docstring.",
+            file=sys.stderr,
+        )
+        keep_indices = sorted(seen.values())
+        chunks = [chunks[i] for i in keep_indices]
+        ids = [ids[i] for i in keep_indices]
+
     embeddings = [c["embedding"] for c in chunks]
     documents = [c["content"] for c in chunks]
     metadatas = [

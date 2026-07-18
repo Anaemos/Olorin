@@ -22,11 +22,54 @@ if not GROQ_API_KEY:
         "(get one free at console.groq.com)."
     )
 
-# Together AI / Cerebras are V2 stubs — read now so config.py doesn't need
-# to change again when those providers go live, but they're allowed to be
-# absent in V1.
-TOGETHER_API_KEY = os.getenv("TOGETHER_API_KEY")  # None until V2
-CEREBRAS_API_KEY = os.getenv("CEREBRAS_API_KEY")  # None until V2
+# Together AI is a deliberately unbuilt stub (decision 2026-07-13): its
+# free signup credit was retired industry-side in July 2025 and it now
+# requires a $5 minimum purchase, so this project stays free-tier-only
+# and doesn't implement a provider class for it. See
+# OLORIN_PROJECT.md Section 13 for the full reasoning. Read here anyway
+# so config.py doesn't need another change if that decision is revisited.
+TOGETHER_API_KEY = os.getenv("TOGETHER_API_KEY")  # unused — see comment above
+
+# Cerebras — LIVE second-tier cloud fallback (2026-07-13, providers/
+# cerebras_provider.py). Genuinely free (no card, ~1M tokens/day) but
+# optional: None here just means the auto-routing cascade skips it and
+# falls straight to local, same as if it never existed. Get a free key
+# at https://cloud.cerebras.ai.
+CEREBRAS_API_KEY = os.getenv("CEREBRAS_API_KEY")
+
+# Free-tier model catalog churns (see cerebras_provider.py's module
+# docstring) — env-overridable for exactly that reason, same pattern as
+# GROQ_MODEL below. Check https://inference-docs.cerebras.ai/models/overview
+# if this default ever starts failing.
+CEREBRAS_MODEL = os.getenv("CEREBRAS_MODEL", "gpt-oss-120b")
+
+# web_search tool (Section 9) — all four optional, opt-in via .env.
+# Cascade order (corrected 2026-07-13 after verifying real free-tier
+# terms, not the terms these services advertise on marketing pages):
+#   1. Tavily  — 1,000 queries/month, genuinely RECURRING, no card.
+#      The only backend here with a real sustained-forever-free story.
+#   2. Jina (s.jina.ai) — no card at all, ~1M free tokens per new key
+#      (one-time per key, but large), LLM-ready extracted text like
+#      Tavily (not raw SERP data). Free tier is non-commercial use
+#      (CC-BY-NC) — fine for this portfolio project, but a real license
+#      term, not just a quota.
+#   3. Serper — 2,500 credits, ONE-TIME on signup, NOT monthly (corrected
+#      2026-07-13 — the original "2,500/month" claim in this project's
+#      own docs was wrong). Raw SERP snippets, no content extraction.
+#      Kept as a reserve, not a routine fallback, since spending it
+#      doesn't come back.
+#   4. Exa — opt-in, last resort. $10 one-time credit with no card
+#      (~1,400 searches at $7/1k); the oft-advertised "1,000/month
+#      recurring" figure only applies if a payment method is added,
+#      which this project deliberately declines (same reasoning as
+#      dropping Together AI, Section 13). Strongest semantic/neural
+#      search quality of the four, which is why it's kept as an opt-in
+#      extra hop rather than dropped entirely, despite the shallow free
+#      tier. See tools/websearch.py for the full cascade implementation.
+TAVILY_API_KEY = os.getenv("TAVILY_API_KEY")
+JINA_API_KEY = os.getenv("JINA_API_KEY")
+SERPER_API_KEY = os.getenv("SERPER_API_KEY")
+EXA_API_KEY = os.getenv("EXA_API_KEY")
 
 
 # --- Local (Ollama) settings ---------------------------------------------
@@ -83,6 +126,12 @@ if __name__ == "__main__":
     print("Config loaded successfully.")
     print(f"  Groq API key present: {bool(GROQ_API_KEY)}")
     print(f"  Groq model: {GROQ_MODEL}")
+    print(f"  Cerebras API key present: {bool(CEREBRAS_API_KEY)}")
+    print(f"  Cerebras model: {CEREBRAS_MODEL}")
+    print(f"  Tavily API key present: {bool(TAVILY_API_KEY)}")
+    print(f"  Jina API key present: {bool(JINA_API_KEY)}")
+    print(f"  Serper API key present: {bool(SERPER_API_KEY)}")
+    print(f"  Exa API key present: {bool(EXA_API_KEY)}")
     print(f"  Ollama base URL: {OLLAMA_BASE_URL}")
     print(f"  Boromir model: {BOROMIR_MODEL}")
     print(f"  Faramir model: {FARAMIR_MODEL}")

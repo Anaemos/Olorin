@@ -51,6 +51,104 @@ QUERY_INSTRUCTION = "Represent this sentence for searching relevant passages: "
 
 _model: SentenceTransformer | None = None
 
+# Real bug found + fixed (2026-07-12): a single chunk (e.g. chunker.py's
+# whole-file fallback for a language it has no grammar for, or just an
+# unusually large function) had no size ceiling at all. bge-small's own
+# encoder silently truncates anything past its ~512-token sequence limit
+# when computing the embedding vector, but the FULL, untruncated text was
+# still what got stored in Chroma and returned to the agent on a hit —
+# meaning a repo containing one very large file (this project's own
+# OLORIN_PROJECT.md and ENGINEERING_JOURNAL.md, by 2026-07-12, were the
+# concrete trigger) could return a single search_codebase result large
+# enough to blow past Groq's free-tier 12,000 TPM limit on its own,
+# crashing a forced-Groq request outright. chunker.py's own docstring
+# already flagged this exact gap and explicitly deferred it here
+# ("chunker.py's job is correct AST-based boundaries, not enforcing a
+# size ceiling specific to one embedding model's limits") — this is that
+# fix, applied generically (any oversized chunk, not just markdown).
+MAX_CHUNK_CHARS = 2000  # roughly bge-small's own ~512 token limit, so
+                         # what gets embedded and what gets stored/
+                         # returned stay honestly in sync with each other
+
+
+def _split_oversized_chunks(chunks: list[dict]) -> list[dict]:
+    """
+    Splits any chunk whose content exceeds MAX_CHUNK_CHARS into multiple
+    sequential sub-chunks, each retaining the original chunk's metadata
+    (file, language, type, repo) but with a distinct, genuine line range
+    and an annotated "name". Chunks under the limit pass through
+    unchanged.
+
+    Splits by actual line boundaries, not raw character offsets —
+    important for correctness, not just readability: store.py's
+    _chunk_id() derives a chunk's Chroma ID from file + lines. Sub-chunks
+    that all kept the parent's original "lines" value would all hash to
+    the SAME id and silently overwrite each other on upsert, leaving only
+    the last piece actually stored. Real, distinct line ranges per
+    sub-chunk avoids that collision and is also more honest metadata than
+    a fake "(part N/M)" suffix alone would be.
+
+    Deliberately a blunt line-budget split, not markdown/AST-aware — a
+    smarter split (e.g. by markdown header) would be a real improvement
+    for long docs specifically, but this generic fix is what actually
+    prevents the crash it was found from (OLORIN_PROJECT.md Section 13),
+    and it protects against any oversized chunk, not just markdown.
+    Revisit with something smarter if retrieval quality on long docs
+    proves to need it.
+    """
+    result = []
+    for chunk in chunks:
+        content = chunk["content"]
+        if len(content) <= MAX_CHUNK_CHARS:
+            result.append(chunk)
+            continue
+
+        # Real bug found + fixed (2026-07-12, same session as the fix
+        # above): the first version of this split used line numbers
+        # relative to the chunk's OWN extracted text (always starting at
+        # 1), not the file's actual absolute line numbers — meaning any
+        # two oversized chunks in the SAME file with roughly similar
+        # size/structure would deterministically produce IDENTICAL
+        # relative sub-ranges ("1-55", "56-100", ...), colliding on
+        # store.py's file+lines chunk ID and crashing ChromaDB's upsert
+        # with a DuplicateIDError. Not a rare coincidence — any file with
+        # 2+ chunks needing splitting would hit this deterministically.
+        # Fixed by anchoring each sub-chunk's line numbers to the
+        # ORIGINAL chunk's true starting line (parsed from its own
+        # "lines" metadata), so sub-chunk ranges reflect real file
+        # positions and stay genuinely unique.
+        orig_start_line = int(chunk["lines"].split("-")[0])
+
+        lines = content.split("\n")
+        parts: list[tuple[str, int, int]] = []  # (text, start_line, end_line)
+        current_lines: list[str] = []
+        current_len = 0
+        start_line = orig_start_line
+
+        for offset, line in enumerate(lines):
+            current_lines.append(line)
+            current_len += len(line) + 1
+            absolute_line = orig_start_line + offset
+            if current_len >= MAX_CHUNK_CHARS:
+                parts.append(("\n".join(current_lines), start_line, absolute_line))
+                current_lines = []
+                current_len = 0
+                start_line = absolute_line + 1
+
+        if current_lines:
+            end_line = orig_start_line + len(lines) - 1
+            parts.append(("\n".join(current_lines), start_line, end_line))
+
+        total = len(parts)
+        for idx, (text, start, end) in enumerate(parts, start=1):
+            sub_chunk = dict(chunk)
+            sub_chunk["content"] = text
+            sub_chunk["name"] = f"{chunk['name']} (part {idx}/{total})"
+            sub_chunk["lines"] = f"{start}-{end}"
+            result.append(sub_chunk)
+
+    return result
+
 
 def _get_device() -> str:
     if torch.cuda.is_available():
@@ -94,6 +192,8 @@ def embed_chunks(chunks: list[dict], batch_size: int = 32) -> list[dict]:
     """
     if not chunks:
         return []
+
+    chunks = _split_oversized_chunks(chunks)
 
     model = get_model()
     texts = [c["content"] for c in chunks]
