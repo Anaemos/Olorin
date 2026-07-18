@@ -8,8 +8,16 @@ request, based on:
 
   1. Post-retrieval complexity scoring (query + retrieved context, NOT
      query alone — see score_complexity() below)
-  2. Circuit breaker state (has Groq been rate-limited recently?)
-  3. Explicit CLI override (--provider groq / --provider ollama / --force-local)
+  2. Circuit breaker state (has Groq/Cerebras been rate-limited recently?)
+  3. Explicit CLI override (--provider groq/cerebras/boromir/faramir or --force-local)
+
+CASCADE (auto mode, Section 7): Groq -> Cerebras -> local (Boromir).
+Cerebras (added 2026-07-13) is a second, optional cloud tier — tried
+only when Groq fails or its circuit is open, and only if a
+CEREBRAS_API_KEY is actually configured. Together AI was the other
+originally-planned V2 cloud fallback but is deliberately not
+implemented (its free tier was retired industry-side; see
+providers/cerebras_provider.py and OLORIN_PROJECT.md Section 13).
 
 V1 SCOPE NOTE: the doc's Section 2 lore already assigns Faramir to
 reasoning and Boromir to code/tools, but true specialist routing between
@@ -27,6 +35,7 @@ import config
 from core.logging_config import get_logger
 from memory import cache
 from providers.base import BaseProvider, ProviderError, ProviderResponse
+from providers.cerebras_provider import CerebrasProvider
 from providers.groq_provider import GroqProvider
 from providers.ollama_provider import OllamaProvider
 
@@ -37,8 +46,22 @@ PLANNING_WORDS = (
     "approach", "structure", "optimize", "review", "why",
 )
 
+# Per-distinct-file-beyond-the-first weight for the multi-file detection
+# term (added 2026-07-15, closing the half of the V2 "better complexity
+# scoring" item deliberately deferred on 2026-07-14 — see
+# score_complexity()'s docstring below and OLORIN_PROJECT.md Section 13).
+# Same tunable-without-code-changes philosophy as COMPLEXITY_THRESHOLD,
+# but kept as a module constant rather than env-configurable since it's
+# an internal scoring weight, not an operational knob anyone's expected
+# to tune per-deployment the way the threshold is.
+MULTI_FILE_WEIGHT = 3
 
-def score_complexity(query: str, retrieved_chunks: list[str] | None = None) -> int:
+
+def score_complexity(
+    query: str,
+    retrieved_chunks: list[str] | None = None,
+    retrieved_files: set[str] | list[str] | None = None,
+) -> int:
     """
     Post-retrieval complexity scorer (OLORIN_PROJECT.md Section 7).
 
@@ -47,9 +70,33 @@ def score_complexity(query: str, retrieved_chunks: list[str] | None = None) -> i
     18 files and 8 middleware layers, the retrieved context is the real
     signal of difficulty — not the five words the user typed.
 
+    retrieved_files (added 2026-07-15): distinct file/module identifiers
+    the retrieved_chunks actually came from — e.g. {"core/agent.py",
+    "tools/search.py"} for a search_codebase result spanning two files,
+    or capsule module names on step 1 (Agent.run() seeds both lists from
+    the same capsule fetch, same as it already did for retrieved_chunks
+    alone). This is a genuinely different signal than chunk COUNT: five
+    chunks from one file (a single function explained five different
+    ways by the retriever) is meaningfully less complex than five chunks
+    spanning five files (a question that actually requires understanding
+    how separate parts of the system relate) — raw chunk count alone
+    can't distinguish those two cases, only file attribution can. Scored
+    as (distinct_files - 1) * MULTI_FILE_WEIGHT rather than distinct_files
+    directly, deliberately: touching exactly one file isn't a "spans
+    multiple files" situation at all, so it should contribute zero here,
+    not a baseline amount that then just stacks on top of the existing
+    chunk-count term for no new information.
+
+    Deferred narrower than this on 2026-07-14 alongside the capsule-
+    seeding fix specifically because it needed retrieved_chunks to carry
+    file attribution, which it didn't yet — this is that follow-up,
+    scoped to exactly the gap that was named at the time (see
+    OLORIN_PROJECT.md Section 13's 2026-07-14 entry).
+
     Returns a raw score; caller compares against config.COMPLEXITY_THRESHOLD.
     """
     retrieved_chunks = retrieved_chunks or []
+    retrieved_files = retrieved_files or []
 
     score = 0
     score += len(retrieved_chunks) * 2  # more chunks = harder
@@ -58,6 +105,10 @@ def score_complexity(query: str, retrieved_chunks: list[str] | None = None) -> i
 
     lowered = query.lower()
     score += sum(2 for w in PLANNING_WORDS if w in lowered)
+
+    distinct_files = len(set(retrieved_files))
+    if distinct_files > 1:
+        score += (distinct_files - 1) * MULTI_FILE_WEIGHT
 
     return score
 
@@ -73,6 +124,14 @@ class LLMClient:
 
     def __init__(self):
         self.groq: BaseProvider = GroqProvider()
+        # Optional second-tier cloud fallback (2026-07-13) — constructed
+        # unconditionally (never fails without a key, unlike Groq), tried
+        # in the cascade only when Groq itself failed/circuit-open AND
+        # a real key is configured (self.cerebras.is_available()).
+        # Together AI was the other originally-planned V2 fallback but is
+        # deliberately not implemented — see providers/cerebras_provider.py's
+        # module docstring and OLORIN_PROJECT.md Section 13.
+        self.cerebras: BaseProvider = CerebrasProvider()
         self.local_providers: dict[str, BaseProvider] = {
             # think=False: Boromir's role (Section 2) is fast, task-
             # focused tool execution, not deliberation. Now that its
@@ -91,9 +150,12 @@ class LLMClient:
         self.default_local = "boromir"  # see V1 SCOPE NOTE above
 
         # Circuit breaker state — see OLORIN_PROJECT.md Section 7.
-        # None means "not tripped". A datetime means "skip Groq until this
-        # time passes, go straight to local instead of retrying."
+        # None means "not tripped". A datetime means "skip this provider
+        # until this time passes". Cerebras gets its own independent
+        # breaker (added 2026-07-13) — a Cerebras 429 says nothing about
+        # Groq's health or vice versa, so a shared flag would be wrong.
         self._groq_disabled_until: datetime.datetime | None = None
+        self._cerebras_disabled_until: datetime.datetime | None = None
 
     def _groq_circuit_open(self) -> bool:
         if self._groq_disabled_until is None:
@@ -104,12 +166,22 @@ class LLMClient:
         cooldown = datetime.timedelta(minutes=config.CIRCUIT_BREAKER_COOLDOWN_MINUTES)
         self._groq_disabled_until = datetime.datetime.now() + cooldown
 
+    def _cerebras_circuit_open(self) -> bool:
+        if self._cerebras_disabled_until is None:
+            return False
+        return datetime.datetime.now() < self._cerebras_disabled_until
+
+    def _trip_cerebras_circuit(self):
+        cooldown = datetime.timedelta(minutes=config.CIRCUIT_BREAKER_COOLDOWN_MINUTES)
+        self._cerebras_disabled_until = datetime.datetime.now() + cooldown
+
     def chat(
         self,
         messages: list,
         tools: list | None = None,
         query: str = "",
         retrieved_chunks: list[str] | None = None,
+        retrieved_files: set[str] | list[str] | None = None,
         force_provider: str | None = None,
         think_override: bool | None = None,
     ) -> ProviderResponse:
@@ -124,7 +196,13 @@ class LLMClient:
             retrieved_chunks: Retrieved RAG context (strings) — used for
                    complexity scoring. Empty/None is fine before the
                    indexer exists (score will just be low, favoring local).
-            force_provider: "groq" | "boromir" | "faramir" | None.
+            retrieved_files: Distinct file/module identifiers the
+                   retrieved_chunks came from (added 2026-07-15, see
+                   score_complexity()'s docstring) — used for the
+                   multi-file-detection scoring term. Empty/None just
+                   means that term contributes zero, same graceful-
+                   degradation shape as retrieved_chunks.
+            force_provider: "groq" | "cerebras" | "boromir" | "faramir" | None.
                    None means "let the complexity scorer decide" (the
                    --provider auto CLI default). Anything else bypasses
                    scoring entirely — this is what --force-local and
@@ -173,7 +251,7 @@ class LLMClient:
                     output_tokens=cached["output_tokens"],
                 )
 
-        response = self._route(messages, tools, query, retrieved_chunks, force_provider, think_override)
+        response = self._route(messages, tools, query, retrieved_chunks, retrieved_files, force_provider, think_override)
 
         logger.info(
             f"provider={response.provider} model={response.model} "
@@ -199,40 +277,122 @@ class LLMClient:
         tools: list | None,
         query: str,
         retrieved_chunks: list[str] | None,
+        retrieved_files: set[str] | list[str] | None,
         force_provider: str | None,
         think_override: bool | None = None,
     ) -> ProviderResponse:
         """Actual provider-selection logic, separated from chat() so
         caching/logging wraps this cleanly without duplicating routing
         rules."""
+        if force_provider == "cerebras":
+            # Same fallback pattern as forced-groq below — bug #10's fix
+            # (2026-07-12) established that every forced-provider branch
+            # must degrade to local on failure, never propagate a raw
+            # exception up to the CLI. Doesn't pre-check is_available()
+            # here (unlike the auto-mode cascade further down) since a
+            # forced call is an explicit user request — if there's no key
+            # configured, let the real 401 surface through chat() as a
+            # normal ProviderError and fall back the same way any other
+            # Cerebras failure would.
+            try:
+                return self.cerebras.chat(messages, tools=tools, think_override=think_override)
+            except ProviderError as e:
+                logger.warning(
+                    f"Forced Cerebras call failed, falling back to "
+                    f"{self.default_local}: {e}"
+                )
+                if e.is_rate_limit:
+                    self._trip_cerebras_circuit()
+                return self.local_providers[self.default_local].chat(
+                    messages, tools=tools, think_override=think_override
+                )
+
         if force_provider == "groq":
-            return self.groq.chat(messages, tools=tools, think_override=think_override)
+            # Real bug found + fixed (2026-07-12): this branch had NO
+            # fallback at all, unlike the auto-mode Groq attempt below —
+            # any Groq failure (rate limit, request-too-large, network)
+            # propagated all the way up as an unhandled ProviderError and
+            # crashed the CLI with a raw traceback. Went unnoticed while
+            # forcing Groq explicitly was rare; became easy to hit the
+            # moment direct-address routing ("Groq, ...") made forcing
+            # Groq a normal, frequent thing to type. Mirrors the
+            # auto-mode fallback below exactly, rather than inventing a
+            # second fallback policy.
+            try:
+                return self.groq.chat(messages, tools=tools, think_override=think_override)
+            except ProviderError as e:
+                logger.warning(
+                    f"Forced Groq call failed, falling back to "
+                    f"{self.default_local}: {e}"
+                )
+                if e.is_rate_limit:
+                    self._trip_groq_circuit()
+                return self.local_providers[self.default_local].chat(
+                    messages, tools=tools, think_override=think_override
+                )
 
         if force_provider in self.local_providers:
             return self.local_providers[force_provider].chat(messages, tools=tools, think_override=think_override)
 
         # --- Auto mode: complexity scorer decides ---------------------
-        score = score_complexity(query, retrieved_chunks)
+        score = score_complexity(query, retrieved_chunks, retrieved_files)
         should_try_groq = score > config.COMPLEXITY_THRESHOLD
 
         if should_try_groq and not self._groq_circuit_open():
             try:
-                return self.groq.chat(messages, tools=tools, think_override=think_override)
+                response = self.groq.chat(messages, tools=tools, think_override=think_override)
+                # Attach the score that drove this decision — set here,
+                # not inside GroqProvider, since providers have no
+                # visibility into routing (see ProviderResponse's
+                # complexity_score docstring in providers/base.py).
+                response.complexity_score = score
+                return response
             except ProviderError as e:
-                logger.warning(f"Groq failed, falling back to local: {e}")
+                logger.warning(f"Groq failed, trying Cerebras next: {e}")
                 if e.is_rate_limit:
                     self._trip_groq_circuit()
                     logger.warning(
                         f"Groq circuit breaker tripped for "
                         f"{config.CIRCUIT_BREAKER_COOLDOWN_MINUTES} min"
                     )
-                # Fall through to local on ANY Groq failure, not just
-                # rate limits — a timeout or outage shouldn't block the
-                # user when a local model is sitting right there.
+                # Fall through to Cerebras (if configured) rather than
+                # straight to local — same complexity gate, one more
+                # cloud-tier attempt before giving up on cloud entirely.
 
-        # Local fallback — either complexity was low, Groq's circuit is
-        # open, or Groq just failed above.
-        return self.local_providers[self.default_local].chat(messages, tools=tools, think_override=think_override)
+        # Cerebras — second-tier cloud fallback (2026-07-13), attempted
+        # under the identical should_try_groq gate: it's a cloud
+        # escalation for queries the scorer already judged worth it, not
+        # a separate routing tier with its own threshold. Only tried when
+        # Groq didn't already succeed above (should_try_groq was true but
+        # we're still here) AND a key is actually configured
+        # (is_available() check, unlike the forced-provider branch above —
+        # here it's a silent auto-routing decision, so skipping a
+        # guaranteed-401 network call entirely is worth the extra check).
+        if (
+            should_try_groq
+            and self.cerebras.is_available()
+            and not self._cerebras_circuit_open()
+        ):
+            try:
+                response = self.cerebras.chat(messages, tools=tools, think_override=think_override)
+                response.complexity_score = score
+                logger.info("Escalated to Cerebras after Groq unavailable/failed")
+                return response
+            except ProviderError as e:
+                logger.warning(f"Cerebras failed, falling back to local: {e}")
+                if e.is_rate_limit:
+                    self._trip_cerebras_circuit()
+                    logger.warning(
+                        f"Cerebras circuit breaker tripped for "
+                        f"{config.CIRCUIT_BREAKER_COOLDOWN_MINUTES} min"
+                    )
+
+        # Local fallback — either complexity was low, both cloud tiers'
+        # circuits are open, neither is configured, or both just failed
+        # above.
+        response = self.local_providers[self.default_local].chat(messages, tools=tools, think_override=think_override)
+        response.complexity_score = score
+        return response
 
 
 if __name__ == "__main__":
@@ -255,4 +415,22 @@ if __name__ == "__main__":
         retrieved_chunks=["chunk " * 100 for _ in range(10)],
     )
     print(f"Routed to: {result.provider} ({result.model}) | {result.latency_ms}ms")
-    print(f"Response: {result.content}")
+    print(f"Response: {result.content}\n")
+
+    print("--- Multi-file query (same chunk count/volume as a low-complexity")
+    print("    single-file case, but spans several files — should score")
+    print("    higher via the multi-file term added 2026-07-15) ---")
+    single_file_score = score_complexity(
+        "what does this do?",
+        retrieved_chunks=["def foo(): return 1"] * 3,
+        retrieved_files={"core/agent.py"},
+    )
+    multi_file_score = score_complexity(
+        "what does this do?",
+        retrieved_chunks=["def foo(): return 1"] * 3,
+        retrieved_files={"core/agent.py", "core/llm_client.py", "tools/search.py"},
+    )
+    print(f"Same query/chunks, 1 file:  score={single_file_score}")
+    print(f"Same query/chunks, 3 files: score={multi_file_score}")
+    assert multi_file_score > single_file_score, "multi-file term isn't contributing"
+    print("OK — multi-file spread scores higher than single-file, same chunk volume")
