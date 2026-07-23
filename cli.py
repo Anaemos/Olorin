@@ -142,6 +142,7 @@ def _index_repo(repo_path: str, verbose: bool = True) -> dict:
     # which are slow to import and unnecessary for `ask` or `--help` when
     # nothing actually needs indexing.
     from indexer.chunker import chunk_file
+    from indexer.documents import extract_pdf_chunks
     from indexer.embedder import embed_chunks
     from indexer.imports import extract_raw_imports, resolve_imports
     from indexer.store import get_collection, get_indexed_file_hash, delete_file, upsert_chunks
@@ -183,13 +184,31 @@ def _index_repo(repo_path: str, verbose: bool = True) -> dict:
             continue
 
         abs_path = os.path.join(repo_path, rel_path)
-        try:
-            with open(abs_path, "r", encoding="utf-8", errors="replace") as fh:
-                content = fh.read()
-        except OSError as e:
-            if verbose:
-                typer.secho(f"  skip (read error) {rel_path}: {e}", fg=typer.colors.YELLOW)
-            continue
+
+        # Document ingestion (V3, "PDF -> same ChromaDB index as code",
+        # Section 11): detected by extension here, not by the Rust
+        # walker's "language" field. The walker reports "unknown" for
+        # .pdf (indexer_core/src/main.rs's detect_language() has no PDF
+        # case) — extending it would mean a `cargo build --release` this
+        # session has no way to run remotely. Checking the extension
+        # directly on the Python side instead means zero changes to the
+        # walker and zero dependency on rebuilding it: the walker already
+        # discovers .pdf files fine (it walks and hashes every non-
+        # gitignored file regardless of type), just under
+        # language="unknown", which this branch simply doesn't trust.
+        is_pdf = rel_path.lower().endswith(".pdf")
+
+        if is_pdf:
+            content = None  # PDFs never go through the text-read path below
+            chunks = extract_pdf_chunks(abs_path, rel_path, repo=repo_path)
+        else:
+            try:
+                with open(abs_path, "r", encoding="utf-8", errors="replace") as fh:
+                    content = fh.read()
+            except OSError as e:
+                if verbose:
+                    typer.secho(f"  skip (read error) {rel_path}: {e}", fg=typer.colors.YELLOW)
+                continue
 
         # Full re-chunk on any change: clear this file's old chunks first
         # so stale line-range entries from a shrunk/reshaped file don't
@@ -197,27 +216,35 @@ def _index_repo(repo_path: str, verbose: bool = True) -> dict:
         if existing_hash is not None:
             delete_file(collection, rel_path)
 
-        chunks = chunk_file(rel_path, content, language, repo=repo_path)
+        if not is_pdf:
+            chunks = chunk_file(rel_path, content, language, repo=repo_path)
+
         for c in chunks:
             c["file_hash"] = file_hash
         chunks = embed_chunks(chunks)
         total_chunks += upsert_chunks(collection, chunks)
 
         # Import graph (V3, "why is this file important?", Section 11):
+        # code-only — a PDF has no imports to extract. Skipped explicitly
+        # rather than relying on extract_raw_imports() harmlessly
+        # returning [] for an unmapped language ("pdf" isn't in
+        # LANGUAGE_MAP either way), so the "not applicable to documents"
+        # intent is visible here rather than an implicit fallthrough.
         # mechanical, no LLM call, so it rides along with every
-        # (re)indexed file rather than needing its own hash-tracking
+        # (re)indexed code file rather than needing its own hash-tracking
         # table — see memory/import_graph.py's module docstring for why
         # that's a deliberate simplification, not a missing feature.
         # Best-effort: an extraction failure on one file (e.g. a genuine
         # parse error) shouldn't lose the chunking/embedding work that
         # already succeeded above for that same file.
-        try:
-            raw_imports = extract_raw_imports(content, language)
-            resolved_imports = resolve_imports(rel_path, raw_imports, language, repo_files)
-            import_graph_store.set_file_imports(repo_path, rel_path, resolved_imports)
-        except Exception as e:
-            if verbose:
-                typer.secho(f"  import graph failed for {rel_path}: {e}", fg=typer.colors.YELLOW)
+        if not is_pdf:
+            try:
+                raw_imports = extract_raw_imports(content, language)
+                resolved_imports = resolve_imports(rel_path, raw_imports, language, repo_files)
+                import_graph_store.set_file_imports(repo_path, rel_path, resolved_imports)
+            except Exception as e:
+                if verbose:
+                    typer.secho(f"  import graph failed for {rel_path}: {e}", fg=typer.colors.YELLOW)
 
         reindexed += 1
         if verbose:
@@ -296,6 +323,15 @@ def _index_repo(repo_path: str, verbose: bool = True) -> dict:
 def ask(
     query: str = typer.Argument(..., help="Your question about the codebase."),
     path: str = typer.Option(".", "--path", "-p", help="Repo root to query."),
+    repos: str = typer.Option(
+        None, "--repos",
+        help=(
+            "Comma-separated additional repo paths to search alongside "
+            "--path (cross-repo querying, V3) — e.g. "
+            "--repos ../other-repo,../third-repo. search_codebase spans "
+            "all of them; every other tool stays scoped to --path only."
+        ),
+    ),
     provider: str = typer.Option(
         "auto", "--provider",
         help="Force a specific backend: groq | cerebras | boromir | faramir | auto.",
@@ -341,11 +377,31 @@ def ask(
         # cost even if the agent never ends up calling search_codebase —
         # exactly the kind of thing this measurement work exists to find.
         from core.agent import Agent
+    from core.llm_client import select_local_specialist
 
     repo_path = os.path.abspath(path)
     if not os.path.isdir(repo_path):
         typer.secho(f"Not a directory: {repo_path}", fg=typer.colors.RED)
         raise typer.Exit(code=1)
+
+    # Cross-repo querying (V3, "cross-repo querying", Section 11): each
+    # extra repo is validated up front, the same way the primary --path
+    # already is — fail fast on a typo'd path rather than discovering it
+    # mid-indexing. Comma-separated (--repos a,b,c), chosen directly over
+    # repeated --path-style flags for this option specifically, since a
+    # single string is simpler to parse than typer's multi-value option
+    # handling for what's expected to be an occasional, short list.
+    extra_repo_paths: list[str] = []
+    if repos:
+        for r in repos.split(","):
+            r = r.strip()
+            if not r:
+                continue
+            abs_r = os.path.abspath(r)
+            if not os.path.isdir(abs_r):
+                typer.secho(f"Not a directory: {abs_r}", fg=typer.colors.RED)
+                raise typer.Exit(code=1)
+            extra_repo_paths.append(abs_r)
 
     if not skip_index:
         from indexer.store import get_collection
@@ -375,15 +431,52 @@ def ask(
                 fg=typer.colors.CYAN,
             )
 
+        # Each extra repo gets the identical automatic freshness check as
+        # the primary repo — consistent with index-on-demand's whole
+        # premise (Section 8/13): a cross-repo query shouldn't require the
+        # user to have separately remembered to run `index` on every repo
+        # first. --skip-index skips this for extras too, same flag,
+        # same intent ("I know what I'm doing, don't index anything").
+        for extra_path in extra_repo_paths:
+            was_empty = get_collection(extra_path).count() == 0
+            if was_empty:
+                typer.secho(
+                    f"First time indexing {extra_path} — this may take a minute...",
+                    fg=typer.colors.CYAN,
+                )
+
+            with profiling.span("auto_index_check", top_level=True):
+                extra_stats = _index_repo(extra_path, verbose=False)
+
+            if not was_empty and (extra_stats["reindexed"] > 0 or extra_stats["capsules_generated"] > 0):
+                typer.secho(
+                    f"{extra_path} changed since last index: "
+                    f"{extra_stats['reindexed']} file(s) updated, "
+                    f"{extra_stats['capsules_generated']} capsule(s) "
+                    f"regenerated ({extra_stats['elapsed']:.1f}s).",
+                    fg=typer.colors.CYAN,
+                )
+
     force_provider = None
     if force_local:
-        force_provider = "boromir"
+        # Real gap found + fixed (2026-07-21, closing out specialist-
+        # routing's loose ends): this used to hardcode force_provider =
+        # "boromir" unconditionally, meaning --force-local always meant
+        # Boromir regardless of what the query actually was — bypassing
+        # the exact specialist heuristic (core/llm_client.py's
+        # select_local_specialist()) that the internal auto-mode-
+        # falls-through-to-local path already uses. No principled reason
+        # --force-local should mean something narrower ("never call
+        # cloud, and also always Boromir specifically") than "never call
+        # cloud, but otherwise route normally" — so it now gets the same
+        # persona choice any other local-bound query would.
+        force_provider = select_local_specialist(query)
     elif provider != "auto":
         force_provider = provider
 
     try:
         with profiling.span("total_request", top_level=True):
-            agent = Agent(repo_root=repo_path)
+            agent = Agent(repo_root=repo_path, extra_repo_roots=extra_repo_paths)
             answer = agent.run(query, force_provider=force_provider)
     except Exception as e:
         # Safety net for whatever LLMClient._route() couldn't already

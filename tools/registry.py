@@ -32,7 +32,11 @@ TOOL_SCHEMAS = [
                 "Semantic search over the indexed codebase. Returns the "
                 "most relevant code chunks for a natural-language query. "
                 "If the repo hasn't been indexed yet, returns an error "
-                "directing you to use list_files/read_file instead."
+                "directing you to use list_files/read_file instead. If "
+                "cross-repo mode is active for this session, also "
+                "searches across the additional configured repos — each "
+                "returned chunk includes a 'repo' field so you can tell "
+                "which repo it came from."
             ),
             "parameters": {
                 "type": "object",
@@ -246,7 +250,12 @@ TOOL_SCHEMAS = [
 ]
 
 
-def execute_tool(tool_name: str, arguments: dict, repo_root: str) -> dict:
+def execute_tool(
+    tool_name: str,
+    arguments: dict,
+    repo_root: str,
+    extra_repo_roots: list[str] | None = None,
+) -> dict:
     """
     Dispatches a tool call by name to its implementation.
 
@@ -256,11 +265,16 @@ def execute_tool(tool_name: str, arguments: dict, repo_root: str) -> dict:
                    "git_diff".
         arguments: Parsed arguments dict (already json.loads'd from the
                    provider's raw tool_call.arguments string by the caller).
-        repo_root: Absolute path to the repo being queried — injected here
-                   rather than trusted from model-supplied arguments, so
-                   the agent can never be tricked into pointing read_file/
-                   list_files at a different directory via a crafted
-                   tool-call argument.
+        repo_root: Absolute path to the primary repo being queried —
+                   injected here rather than trusted from model-supplied
+                   arguments, so the agent can never be tricked into
+                   pointing read_file/list_files at a different directory
+                   via a crafted tool-call argument.
+        extra_repo_roots: Optional additional repo paths (V3, cross-repo
+                   querying, Section 11) — only ever consulted by
+                   search_codebase; every other tool stays scoped to
+                   repo_root alone, a deliberate scope decision, not an
+                   oversight (see tools/search.py's module docstring).
 
     Returns:
         dict — JSON-serializable tool result. Unknown tool names return
@@ -272,6 +286,7 @@ def execute_tool(tool_name: str, arguments: dict, repo_root: str) -> dict:
             query=arguments.get("query", ""),
             repo_root=repo_root,
             n_results=arguments.get("n_results", 5),
+            extra_repo_roots=extra_repo_roots,
         )
 
     if tool_name == "search_history":

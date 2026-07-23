@@ -76,10 +76,16 @@ EXA_API_KEY = os.getenv("EXA_API_KEY")
 
 OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434/v1")
 
-# Named models (see OLORIN_PROJECT.md Section 4 — these are Modelfile-wrapped
-# versions of the base weights, with 16K context baked in).
-BOROMIR_MODEL = os.getenv("BOROMIR_MODEL", "boromir")
-FARAMIR_MODEL = os.getenv("FARAMIR_MODEL", "faramir")
+# Single collapsed local model (2026-07-20 — see OLORIN_PROJECT.md
+# Section 13's V4 specialist-routing entry). Boromir and Faramir now run
+# on the SAME loaded qwen3:8b weights ("local:latest" — FROM qwen3:8b,
+# num_ctx 16384, nothing persona-specific baked in); persona is purely
+# an application-layer concern now (system prompt text + the `think`
+# flag per request, both applied in core/llm_client.py/core/agent.py),
+# not a Modelfile concept. Verified live: switching `think` on an
+# already-loaded model costs ~0.2s (noise-level) vs ~8s for a genuine
+# cold load — zero swap cost between personas now, they're one model.
+LOCAL_MODEL = os.getenv("LOCAL_MODEL", "local:latest")
 
 # Ollama doesn't require a real API key, but the openai SDK client demands
 # a non-empty string in the constructor. This is a placeholder, not a secret.
@@ -101,9 +107,28 @@ COMPLEXITY_THRESHOLD = int(os.getenv("COMPLEXITY_THRESHOLD", "15"))
 
 # --- Circuit breaker --------------------------------------------------------
 
-# Minutes to disable a provider after a 429 before retrying it.
+# Minutes to disable a provider after a genuinely transient rate limit
+# (per-minute/per-request) before retrying it.
 CIRCUIT_BREAKER_COOLDOWN_MINUTES = int(
     os.getenv("CIRCUIT_BREAKER_COOLDOWN_MINUTES", "5")
+)
+
+# Real gap found live (2026-07-19): a DAILY token-budget exhaustion (Groq's
+# TPD limit, Cerebras's own documented daily-quota case) doesn't recover
+# in 5 minutes the way a per-minute rate limit does — the same daily cap
+# is still exhausted on every retry until it naturally resets. Using the
+# short cooldown for this case meant every subsequent query re-attempted
+# a call guaranteed to fail again, for the rest of the day. A separate,
+# much longer cooldown for specifically-daily-quota errors (detected via
+# providers/base.py's classify_quota_error()) avoids that pointless
+# repeated latency. 240 minutes (4 hours) is a deliberately simple,
+# fixed duration rather than calculating an exact UTC reset time (which
+# neither Groq's nor Cerebras's docs commit to precisely) — long enough
+# to stop the wasteful retry pattern for the rest of a normal working
+# session, short enough not to disable a provider for an entire day if
+# the quota actually resets sooner than expected.
+DAILY_QUOTA_COOLDOWN_MINUTES = int(
+    os.getenv("DAILY_QUOTA_COOLDOWN_MINUTES", "240")
 )
 
 
@@ -133,7 +158,6 @@ if __name__ == "__main__":
     print(f"  Serper API key present: {bool(SERPER_API_KEY)}")
     print(f"  Exa API key present: {bool(EXA_API_KEY)}")
     print(f"  Ollama base URL: {OLLAMA_BASE_URL}")
-    print(f"  Boromir model: {BOROMIR_MODEL}")
-    print(f"  Faramir model: {FARAMIR_MODEL}")
+    print(f"  Local model (Boromir+Faramir, collapsed 2026-07-20): {LOCAL_MODEL}")
     print(f"  Complexity threshold: {COMPLEXITY_THRESHOLD}")
     print(f"  Max agent steps: {MAX_AGENT_STEPS}")

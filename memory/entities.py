@@ -52,13 +52,31 @@ for the call site), using the SAME backend that just answered — no
 separate model choice, no new complexity-based gate. This reuses the
 routing decision the complexity scorer (Section 7) already made instead
 of inventing a second one, and avoids any Ollama model-swap cost since
-that backend is already warm. Faramir is the one deliberate exclusion:
-test_faramir_tools.py already proved she doesn't reliably emit
-structured output (narrates prose instead of returning clean tool_calls,
-with no malformed JSON for a fallback parser to even catch) — asking her
-to emit a clean entities JSON block after answering would hit the
-identical failure mode, just relocated. See _UNRELIABLE_STRUCTURED_
-OUTPUT_BACKENDS below.
+that backend is already warm.
+
+Faramir's exclusion REMOVED 2026-07-21 (was: _UNRELIABLE_STRUCTURED_
+OUTPUT_BACKENDS = {"faramir"}, added 2026-07-15). Worth being precise
+about why the original exclusion didn't actually hold up under
+inspection, not just "the underlying model changed": extract_candidates()
+below has never called llm_client.chat() with a tools= argument at all —
+this is, and always was, a plain-text completion asking the model to
+write a JSON array as its response, parsed by _parse_json_array() below.
+test_faramir_tools.py (which motivated the original exclusion) tested a
+genuinely different capability: whether DeepSeek-R1 could trigger the
+API's structured tool_calls mechanism. "Can't reliably use tool_calls"
+and "can't reliably write JSON as plain text" are not the same claim,
+and the exclusion here was conflating them even before the 2026-07-20
+Boromir/Faramir model collapse made the point moot anyway (both
+personas now share qwen3:8b, which reliably does BOTH). One residual
+question checked before removing this, not assumed: Ollama's native API
+already separates a thinking-mode response's reasoning trace
+(message.thinking) from its actual answer (message.content) — see
+providers/ollama_provider.py's chat() — so Faramir's think=True content
+field shouldn't have stray <think> text bleeding into what
+_parse_json_array() tries to parse. Not yet re-verified against a real
+live Faramir-backed extraction call as of this change; worth confirming
+with a real `cli.py ask "Faramir, ..."` on a decision-shaped query and
+checking `cli.py entities` afterward.
 
 Most exchanges produce zero candidates — that's the expected, normal
 result, not a failure. The extraction prompt says so explicitly.
@@ -141,12 +159,6 @@ _COMMIT_THRESHOLD = "medium"
 # module docstring's DEDUP section explains.
 _NAME_MATCH_THRESHOLD = 0.5
 _DEDUP_MATCH_THRESHOLD = 0.6
-
-# Faramir is excluded from live extraction, not silently forgotten —
-# test_faramir_tools.py (2026-07-13) already proved she doesn't reliably
-# emit structured output. See module docstring's POPULATION MECHANISM
-# section for the full reasoning.
-_UNRELIABLE_STRUCTURED_OUTPUT_BACKENDS = {"faramir"}
 
 
 def _connect() -> sqlite3.Connection:
@@ -439,12 +451,14 @@ def extract_candidates(llm_client, backend_used: str, query: str, answer: str) -
     force_provider so the SAME model that answered does the extraction —
     no separate model choice, no new gate, reuses the routing decision
     the complexity scorer already made. Returns [] (never raises) if
-    llm_client is None, if backend_used is Faramir (see module
-    docstring's POPULATION MECHANISM section), or if the call itself or
-    the response parsing fails — extraction is best-effort by design,
-    never allowed to affect the answer already returned to the user.
+    llm_client is None, or if the call itself or the response parsing
+    fails — extraction is best-effort by design, never allowed to affect
+    the answer already returned to the user. Faramir's old exclusion
+    here was removed 2026-07-21 (see module docstring's POPULATION
+    MECHANISM section) — this function has never actually depended on
+    tool-calling reliability at all, only on writing plain-text JSON.
     """
-    if llm_client is None or backend_used in _UNRELIABLE_STRUCTURED_OUTPUT_BACKENDS:
+    if llm_client is None:
         return []
 
     prompt = _EXTRACTION_PROMPT_TEMPLATE.format(query=query, answer=answer)

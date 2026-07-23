@@ -31,6 +31,7 @@ import json
 import time
 import uuid
 
+import httpx
 import ollama as ollama_lib
 
 import config
@@ -39,6 +40,25 @@ from core.logging_config import get_logger
 from providers.base import BaseProvider, ProviderError, ProviderResponse
 
 logger = get_logger("ollama_provider")
+
+# Real hang found live (2026-07-19): a garbled/oversized prompt (traced
+# to a since-fixed read_file bug returning raw PDF binary bytes as
+# "text" — see tools/reader.py) sent to a local model as the final
+# fallback after Groq and Cerebras both failed produced a call that
+# neither completed nor responded to Ctrl+C, requiring a force-kill.
+# ollama.Client passes **kwargs straight through to httpx.Client (which
+# DOES support a `timeout` kwarg) — confirmed directly by reading
+# ollama.Client.__init__'s source before relying on it, not assumed.
+# Previously unset entirely, meaning every local call was genuinely
+# unbounded. 300s is deliberately generous, not a tight cap: real
+# observed Faramir latencies today (think=True capsule generation) hit
+# 123s on their own, so anything shorter risked false-positive timeouts
+# on legitimately slow-but-working calls. This doesn't fix the root
+# cause (that's tools/reader.py's job) — it's a second, independent
+# layer of defense so a *different* future cause of an oversized/
+# pathological prompt still fails cleanly and boundedly instead of
+# hanging indefinitely and being unresponsive to interruption.
+_OLLAMA_TIMEOUT_SECONDS = 300
 
 
 def _native_host(base_url: str) -> str:
@@ -193,11 +213,20 @@ class OllamaProvider(BaseProvider):
         overhead before a tool call. core/llm_client.py sets this
         explicitly per persona rather than relying on a shared default.
         """
-        self.client = ollama_lib.Client(host=_native_host(config.OLLAMA_BASE_URL))
+        self.client = ollama_lib.Client(
+            host=_native_host(config.OLLAMA_BASE_URL),
+            timeout=_OLLAMA_TIMEOUT_SECONDS,
+        )
         self.model = model_name
         self.think = think
 
-    def chat(self, messages: list, tools: list | None = None, think_override: bool | None = None) -> ProviderResponse:
+    def chat(
+        self,
+        messages: list,
+        tools: list | None = None,
+        think_override: bool | None = None,
+        options_override: dict | None = None,
+    ) -> ProviderResponse:
         # think_override lets a future caller flip this persona into
         # thinking mode for one specific heavy task without changing its
         # standing default (self.think, set at construction — see
@@ -212,9 +241,33 @@ class OllamaProvider(BaseProvider):
                 kwargs["tools"] = tools
             if effective_think is not None:
                 kwargs["think"] = effective_think
+            if options_override:
+                # Sampling params (temperature/top_p/num_predict/
+                # repeat_penalty, etc.) — added 2026-07-21 alongside the
+                # per-persona params split (core/llm_client.py's
+                # _PERSONA_PARAMS). Unlike `think`, these go INSIDE the
+                # `options` sub-object, not top-level — a real, easy-to-
+                # get-backwards distinction in Ollama's API (confirmed
+                # live the hard way with `think` itself earlier this
+                # session; verified for `options` against Ollama's own
+                # API docs before relying on it here).
+                kwargs["options"] = options_override
 
             response = self.client.chat(**kwargs)
 
+        except httpx.TimeoutException:
+            # Distinct from the generic "Ollama unreachable" branch
+            # below on purpose — a timeout means the server WAS reachable
+            # and DID accept the request, it just didn't finish in time.
+            # "is 'ollama serve' running?" would be actively misleading
+            # here; the honest message points at what actually happened.
+            raise ProviderError(
+                f"Ollama request for model '{self.model}' timed out after "
+                f"{_OLLAMA_TIMEOUT_SECONDS}s — the model may be stuck on an "
+                "unusually large or malformed prompt, or the machine is "
+                "under heavy load.",
+                is_rate_limit=False,
+            )
         except ollama_lib.ResponseError as e:
             raise ProviderError(
                 f"Ollama request failed for model '{self.model}': {e}",
@@ -343,18 +396,22 @@ class OllamaProvider(BaseProvider):
 
 if __name__ == "__main__":
     # Manual smoke test: python -m providers.ollama_provider
-    for model_name in (config.BOROMIR_MODEL, config.FARAMIR_MODEL):
-        print(f"\n--- Testing {model_name} ---")
-        provider = OllamaProvider(model_name)
-        print(f"Available: {provider.is_available()}")
+    # Collapsed to one model (2026-07-20) — Boromir and Faramir are now
+    # the SAME weights, tested here via think=False/True on one provider
+    # instance rather than two separate model tags.
+    provider = OllamaProvider(config.LOCAL_MODEL)
+    print(f"Available: {provider.is_available()}")
 
+    for persona, think in (("boromir", False), ("faramir", True)):
+        print(f"\n--- Testing persona={persona} (think={think}) ---")
         result = provider.chat(
             [
                 {
                     "role": "user",
-                    "content": f"Say 'hello from {model_name}' and nothing else.",
+                    "content": f"Say 'hello from {persona}' and nothing else.",
                 }
-            ]
+            ],
+            think_override=think,
         )
         print(f"Response: {result.content}")
         print(
