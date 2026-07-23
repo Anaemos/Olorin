@@ -38,6 +38,46 @@ def _resolve_safe(repo_root: str, relative_path: str) -> str:
     return target_abs
 
 
+def _read_pdf_as_text(abs_path: str, rel_path: str) -> str | None:
+    """
+    read_file()'s PDF path — reuses indexer/documents.py's
+    extract_pdf_chunks() (the same pdfplumber-based extraction
+    search_codebase already benefits from via the index) instead of a
+    raw text-mode open(), which would otherwise decode a PDF's binary
+    bytes as garbage replacement-character text.
+
+    Real bug found live (2026-07-19): before this fix, an agent calling
+    read_file directly on a .pdf path (rather than going through
+    search_codebase) got exactly that garbage. Confirmed directly: a
+    41-page real PDF's raw bytes, decoded as "text" with
+    errors="replace" and capped at read_file's existing 20,000-char
+    max_chars, still tokenized to 27,993 tokens — well past Groq's
+    12,000 TPM cap — and triggered a real 413 (bug #10's class of
+    failure, caught by the existing fallback cascade, but never should
+    have been sent in the first place). Binary garbage tokenizes far
+    less efficiently than real text, so even a char-capped blob of it
+    can still blow a token budget.
+
+    Joins every page's clean extracted text with a page-marker header
+    ("--- Page N ---") so the agent can still tell which page content
+    came from, then lets read_file()'s existing max_chars truncation
+    apply uniformly on top — a large PDF still gets capped the same way
+    a large text file would, just starting from real text instead of
+    noise.
+
+    Returns None (not an exception) if the PDF can't be opened at all or
+    has no extractable text on any page — read_file() turns that into
+    an honest {"error": ...}, same as any other unreadable file.
+    """
+    from indexer.documents import extract_pdf_chunks
+
+    chunks = extract_pdf_chunks(abs_path, rel_path, repo="")
+    if not chunks:
+        return None
+
+    return "\n\n".join(f"--- {c['name']} ---\n{c['content']}" for c in chunks)
+
+
 def read_file(path: str, repo_root: str, max_chars: int = 20000) -> dict:
     """
     Reads a file's contents, scoped to repo_root.
@@ -59,11 +99,19 @@ def read_file(path: str, repo_root: str, max_chars: int = 20000) -> dict:
     if not os.path.isfile(abs_path):
         return {"error": f"File not found: {path}"}
 
-    try:
-        with open(abs_path, "r", encoding="utf-8", errors="replace") as f:
-            content = f.read()
-    except Exception as e:
-        return {"error": f"Failed to read {path}: {e}"}
+    if path.lower().endswith(".pdf"):
+        # See _read_pdf_as_text()'s docstring for the real bug this
+        # branch fixes — a plain text-mode read here would decode
+        # binary PDF bytes as garbage rather than real content.
+        content = _read_pdf_as_text(abs_path, path)
+        if content is None:
+            return {"error": f"Failed to extract text from PDF: {path}"}
+    else:
+        try:
+            with open(abs_path, "r", encoding="utf-8", errors="replace") as f:
+                content = f.read()
+        except Exception as e:
+            return {"error": f"Failed to read {path}: {e}"}
 
     truncated = len(content) > max_chars
     if truncated:

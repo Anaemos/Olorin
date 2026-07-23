@@ -22,7 +22,7 @@ import os
 import re
 
 import config
-from core.llm_client import LLMClient
+from core.llm_client import LLMClient, select_local_specialist
 from core.logging_config import get_logger
 from memory import capsules as capsules_store
 from memory import entities as entities_store
@@ -63,6 +63,62 @@ _PROVIDER_ALIASES = {
 _ADDRESS_PATTERN = re.compile(
     r"^(olorin|groq|cerebras|boromir|faramir)\b[,:]?\s+", re.IGNORECASE,
 )
+
+# Persona voice (added 2026-07-21) — the actual thing missing when the
+# first real Boromir/Faramir comparison came back generic. Sampling
+# params (core/llm_client.py's _PERSONA_PARAMS) change HOW confidently
+# tokens get picked; they were never going to fix a problem they don't
+# cause. Nothing anywhere was telling the model "you are Boromir" or
+# what that should mean — build_system_prompt() always opened with the
+# generic "You are Olorin" framing regardless of which backend actually
+# answered. This is the fix: real, disprovable behavioral instructions,
+# not a label ("you are Boromir the coder") and not a knowledge/
+# capability restriction (that was yesterday's now-removed tool-gating
+# problem, not today's). Boromir's text directly targets the actual
+# failure mode from the first live test — a generic, neutral, numbered-
+# checklist answer ("consider performance, maintainability, feature
+# requirements...") is explicitly called out as the anti-pattern to
+# avoid, not just described abstractly.
+_PERSONA_VOICE = {
+    "boromir": (
+        "You are Boromir. You value decisive, practical action over "
+        "exhaustive analysis. When asked an open question, commit to "
+        "your actual best recommendation FIRST, stated plainly, then "
+        "briefly note the one or two things that would change your "
+        "mind. Do not answer with a neutral checklist of generic "
+        "considerations (\"you should think about performance, "
+        "maintainability, requirements...\") — that's a template, not "
+        "an answer, and it's exactly the failure mode to avoid. If you "
+        "genuinely don't know enough to recommend something, say the "
+        "one specific thing you'd check first and why, then stop."
+    ),
+    "faramir": (
+        "You are Faramir. You value understanding the real shape of a "
+        "problem before committing to an answer — but that means "
+        "forming and stating an actual view, not listing options "
+        "neutrally or opening with a string of clarifying questions "
+        "before saying anything substantive. Ground your reasoning in "
+        "what you've actually retrieved (entity memory, past "
+        "conversations, real code) rather than generic advice. State "
+        "what you think is true or likely right, explain the tradeoffs "
+        "behind it, and note what would change your mind."
+    ),
+}
+
+# Per-persona step budget (added 2026-07-21) — same scope boundary as
+# persona voice above: only applies when the persona is known upfront
+# (direct-address/--provider boromir|faramir), since auto-mode doesn't
+# know which backend will answer until after the first call. Deliberately
+# MILD, not the steep 3-4-step cap an earlier design pass considered —
+# the num_predict cap that got removed this same session (core/
+# llm_client.py's _PERSONA_PARAMS) cut Boromir off mid-sentence, and a
+# too-tight step cap risks the same class of failure in a different
+# shape: forcing "Max reasoning steps reached" on a genuinely multi-step
+# task instead of a slower-but-complete answer. Boromir gets a modest
+# tightening (fast execution is still the intent); Faramir keeps the
+# existing shared default unchanged — already generous, no reason to
+# inflate further just because "deliberation is the point."
+_PERSONA_MAX_STEPS = {"boromir": 6, "faramir": config.MAX_AGENT_STEPS}
 
 
 def parse_direct_address(query: str) -> tuple[str | None, str]:
@@ -158,7 +214,8 @@ def build_system_prompt(
     repo_root: str,
     capsules: list[dict] | None = None,
     olorin_md: str | None = None,
-    tools_available: bool = True,
+    extra_repo_roots: list[str] | None = None,
+    persona: str | None = None,
 ) -> str:
     """
     V1 system prompt + V2's Knowledge Capsules (Section 10/13) + V2's
@@ -188,14 +245,55 @@ def build_system_prompt(
     call this run makes — see load_olorin_md()'s docstring for why it
     can't be stripped the way capsules can.
 
-    tools_available (added 2026-07-13) exists because Faramir is
-    deliberately gated away from every tool, not just web_search — see
-    Agent.run()'s docstring for the isolated test that confirmed she
-    narrates about calling a tool ("Let me pull up...") instead of
-    emitting a real structured call, with no malformed JSON for the
-    existing fallback parser to even catch. Listing five tools she can
-    never actually use would be actively misleading, not a harmless
-    no-op — this flag swaps that section for an explicit note instead.
+    Faramir's tool-gating (tools_available flag, added 2026-07-13) was
+    REMOVED 2026-07-20 — both personas now run on the same qwen3:8b
+    weights, which reliably emits structured tool_calls even with
+    think=True (verified live: a real get_weather-shaped test returned a
+    clean tool_calls array with empty content, not the DeepSeek-R1-era
+    prose-narration failure test_faramir_tools.py originally caught —
+    see OLORIN_PROJECT.md Section 13's V4 entry). Both personas always
+    get the real tool listing below now.
+
+    persona (added 2026-07-21, extended to unaddressed auto-mode
+    2026-07-22) — "boromir"/"faramir"/None. Swaps the opening identity
+    line for real voice content (_PERSONA_VOICE above) instead of the
+    generic "You are Olorin" framing. Two cases now supply a real value:
+    direct-address ("Boromir, ...") / --provider boromir/faramir (known
+    upfront, force_provider already set before this function runs), AND
+    plain unaddressed auto-mode queries, where Agent.run() now calls
+    select_local_specialist(query) itself BEFORE building the first
+    system prompt — the same function core/llm_client.py's _route() was
+    already calling, just moved earlier so its answer can inform the
+    prompt instead of only being decided after the prompt was already
+    sent. This is a real behavioral change from the original design
+    (which left auto-mode as generic "Olorin" framing since the persona
+    genuinely wasn't decided yet at prompt-build time) — the prediction
+    is speculative (the query might still escalate to cloud, in which
+    case a persona-voiced prompt just goes unused by Groq/Cerebras,
+    harmless the same way an OLORIN.md rule that doesn't bear on a given
+    question is harmless) but costs nothing to compute (pure
+    query-text heuristic, no retrieval, no LLM call) and closes the real
+    gap flagged in OLORIN_PROJECT.md Section 13's V4 entries: without
+    it, unaddressed auto-mode traffic — almost certainly the majority
+    of real usage — never benefited from persona voice at all. See
+    Agent.run() for where the prediction is computed once and threaded
+    both here and into LLMClient.chat()'s local_persona_hint, so the
+    persona the prompt commits to and the persona that actually answers
+    can't independently diverge.
+
+    force_provider values other than boromir/faramir/None ("groq",
+    "cerebras") still get generic framing here, deliberately — an
+    explicit cloud address is a real user choice for THIS call to be
+    cloud-voiced (or rather, voice-neutral), not a signal to pre-commit
+    to a local persona that might not even end up answering.
+
+    extra_repo_roots (V3, "cross-repo querying", Section 11) — when set,
+    lists the additional repos search_codebase also searches this run,
+    so the model understands its results may span multiple codebases and
+    can correctly attribute/relate what it finds (each search_codebase
+    chunk carries a "repo" field for exactly this). Every other tool
+    stays scoped to repo_root alone — a deliberate scope decision, see
+    tools/search.py's module docstring.
     """
     capsule_section = ""
     if capsules:
@@ -207,6 +305,20 @@ def build_system_prompt(
             f"{lines}\n"
         )
 
+    cross_repo_section = ""
+    if extra_repo_roots:
+        repo_list = "\n".join(f"  - {r}" for r in extra_repo_roots)
+        cross_repo_section = (
+            "\nsearch_codebase also searches across these additional "
+            f"repos this session (cross-repo mode, V3):\n{repo_list}\n"
+            "Its results include a 'repo' field indicating which repo "
+            "each chunk came from — mention it when relevant, especially "
+            "if comparing or relating code across repos. Every other "
+            "tool (read_file, list_files, git_diff, file_importance, "
+            "search_history, search_entities) is still scoped to the "
+            "primary repository root above only.\n"
+        )
+
     olorin_md_section = ""
     if olorin_md:
         olorin_md_section = (
@@ -216,58 +328,53 @@ def build_system_prompt(
             f"{olorin_md}\n"
         )
 
-    if tools_available:
-        tools_section = (
-            "You have eight tools available:\n"
-            "- search_codebase: semantic search over the indexed codebase — "
-            "try this first for conceptual/\"how does X work\" questions. If "
-            "the repo hasn't been indexed yet, it'll tell you so.\n"
-            "- list_files: list files matching a glob pattern\n"
-            "- read_file: read the full contents of a specific file\n"
-            "- search_history: search past conversations you've had about "
-            "this repo, for questions like 'what did I figure out about X "
-            "before?'\n"
-            "- search_entities: look up decisions and concepts previously "
-            "identified as worth remembering for this repo, for questions "
-            "like 'what did we decide about X?' or 'what's the status of "
-            "Y?'\n"
-            "- file_importance: look up a specific file's import graph — "
-            "how many other files depend on it and what it depends on — "
-            "for questions like 'why does this file matter?' or 'is it safe "
-            "to change X?'\n"
-            "- git_diff: explain what changed via git — uncommitted "
-            "changes by default, or a specific commit/range if given a "
-            "ref, for questions like 'what did I just change?' or 'what "
-            "happened in the last few commits?'\n"
-            "- web_search: search the live web for current information "
-            "outside this codebase and outside your training data (current "
-            "events, library versions, anything time-sensitive) — use it "
-            "instead of guessing when a question needs up-to-date facts\n\n"
-            "When asked about the codebase, ground your answer in the actual "
-            "code rather than guessing — use search_codebase to find relevant "
-            "chunks, falling back to list_files/read_file if search isn't "
-            "available or doesn't find what you need. Give a direct, grounded "
-            "answer once you have enough information — don't call tools more "
-            "than necessary."
-        )
-    else:
-        # Faramir-specific (2026-07-13, Section 9/13) — see build_system_
-        # prompt()'s docstring. She genuinely has no tools this call; this
-        # note exists so she doesn't narrate as if she's about to use one.
-        tools_section = (
-            "You do NOT have access to any tools for this query. Answer "
-            "using only the conversation so far, the repository overview "
-            "above (if shown), and your own knowledge. If you would "
-            "genuinely need to look something up — read a specific file, "
-            "search the codebase, search the web — to answer accurately, "
-            "say so plainly instead of guessing or describing what you "
-            "would do if you could."
-        )
+    tools_section = (
+        "You have eight tools available:\n"
+        "- search_codebase: semantic search over the indexed codebase — "
+        "try this first for conceptual/\"how does X work\" questions. If "
+        "the repo hasn't been indexed yet, it'll tell you so.\n"
+        "- list_files: list files matching a glob pattern\n"
+        "- read_file: read the full contents of a specific file\n"
+        "- search_history: search past conversations you've had about "
+        "this repo, for questions like 'what did I figure out about X "
+        "before?'\n"
+        "- search_entities: look up decisions and concepts previously "
+        "identified as worth remembering for this repo, for questions "
+        "like 'what did we decide about X?' or 'what's the status of "
+        "Y?'\n"
+        "- file_importance: look up a specific file's import graph — "
+        "how many other files depend on it and what it depends on — "
+        "for questions like 'why does this file matter?' or 'is it safe "
+        "to change X?'\n"
+        "- git_diff: explain what changed via git — call with NO ref for "
+        "'what did I just change?' / 'what changed today?' style "
+        "questions; that shows every uncommitted change (working tree + "
+        "staged) vs HEAD, which is what most repos' real recent work "
+        "actually is — don't guess a specific ref/range like HEAD~1 for "
+        "these unless the question explicitly names a commit, a range, "
+        "or asks about commit history specifically.\n"
+        "- web_search: search the live web for current information "
+        "outside this codebase and outside your training data (current "
+        "events, library versions, anything time-sensitive) — use it "
+        "instead of guessing when a question needs up-to-date facts\n\n"
+        "When asked about the codebase, ground your answer in the actual "
+        "code rather than guessing — use search_codebase to find relevant "
+        "chunks, falling back to list_files/read_file if search isn't "
+        "available or doesn't find what you need. Give a direct, grounded "
+        "answer once you have enough information — don't call tools more "
+        "than necessary."
+    )
+
+    identity_line = _PERSONA_VOICE.get(
+        persona,
+        "You are Olorin, a local-first engineering assistant with access "
+        "to tools for exploring a codebase.",
+    )
 
     return (
-        "You are Olorin, a local-first engineering assistant with access "
-        "to tools for exploring a codebase.\n\n"
+        f"{identity_line}\n\n"
         f"The repository root is: {repo_root}\n"
+        f"{cross_repo_section}"
         f"{olorin_md_section}"
         f"{capsule_section}\n"
         f"{tools_section}"
@@ -276,13 +383,28 @@ def build_system_prompt(
 
 class Agent:
     """
-    Owns one LLMClient and runs the ReAct loop against a single repo_root.
+    Owns one LLMClient and runs the ReAct loop against a primary repo_root.
+
+    extra_repo_roots (V3, "cross-repo querying", Section 11): optional
+    additional repo paths whose code also becomes searchable via
+    search_codebase this run. Every other tool (read_file, list_files,
+    git_diff, file_importance, search_history, search_entities) stays
+    scoped to repo_root alone — a deliberate scope decision made
+    directly before writing any code, not an oversight. See tools/
+    search.py's module docstring and indexer/store.py's query_multi()
+    for the actual cross-collection merge logic.
     """
 
-    def __init__(self, repo_root: str, llm_client: LLMClient | None = None):
+    def __init__(
+        self,
+        repo_root: str,
+        llm_client: LLMClient | None = None,
+        extra_repo_roots: list[str] | None = None,
+    ):
         self.repo_root = repo_root
         self.llm = llm_client or LLMClient()
         self.olorin_md = load_olorin_md(repo_root)
+        self.extra_repo_roots = extra_repo_roots or []
 
     def _accumulate_retrieved_chunks(
         self,
@@ -452,26 +574,49 @@ class Agent:
                 force_provider = detected_provider
                 user_query = cleaned_query
 
-        # Faramir tool-calling gate (bug found + fixed 2026-07-13, see
-        # test_faramir_tools.py). An isolated test confirmed she doesn't
-        # reliably use function-calling at all — she narrates about
-        # calling a tool ("Let me pull up the latest weather...") instead
-        # of emitting a structured tool_calls response, and there's no
-        # malformed JSON in that narration for the existing fallback
-        # parser (providers/ollama_provider.py) to catch, since it isn't
-        # a parsing-shape problem. Decided (2026-07-13, confirmed with
-        # Aryavart) to gate tools away from her entirely rather than
-        # chase a prompt/think-mode fix: this actually matches how she's
-        # used everywhere else in the project already — Knowledge Capsule
-        # generation and Engineering Journal synthesis are both single
-        # plain completions with no tools, never a ReAct loop. With
-        # tools=None, the loop below still runs structurally unchanged;
-        # it just always gets finish_reason=="stop" on step 1, since a
-        # model can't be offered tool_calls it was never given tools for.
-        is_faramir = force_provider == "faramir"
-        tools_for_call = None if is_faramir else TOOL_SCHEMAS
-        if is_faramir:
-            logger.info("Faramir selected — tools withheld this run (Section 9/13, 2026-07-13)")
+        # Faramir's tool-calling gate REMOVED (2026-07-20) — both
+        # personas now run on the same qwen3:8b weights, which reliably
+        # emits structured tool_calls even with think=True (verified
+        # live, see OLORIN_PROJECT.md Section 13's V4 entry). Both
+        # personas always get the real tool schema now.
+        tools_for_call = TOOL_SCHEMAS
+
+        # Predicted local persona (2026-07-22) — computed once, here,
+        # BEFORE the first system prompt is built, and threaded to two
+        # places: build_system_prompt() (so unaddressed auto-mode gets
+        # real persona voice too, not just direct-address/--provider
+        # cases) and llm.chat()'s local_persona_hint (so if the run
+        # falls back to local from a forced-cloud failure, or resolves
+        # locally via auto-mode routing, the SAME persona answers that
+        # the prompt already committed to — core/llm_client.py's
+        # _route() would otherwise recompute select_local_specialist()
+        # independently at fallback time, and while today that's
+        # deterministic against the same query text, there's no reason
+        # to rely on two separate call sites implicitly agreeing when
+        # computing it once and passing it through costs nothing.
+        # Always computed (cheap: query-text heuristic, no retrieval, no
+        # LLM call) regardless of force_provider — even a forced-groq/
+        # cerebras call benefits from a consistent fallback persona if
+        # the cloud call fails.
+        predicted_local_persona = select_local_specialist(user_query)
+
+        # Persona voice (2026-07-21, extended to unaddressed auto-mode
+        # 2026-07-22) — known_persona covers direct-address/--provider
+        # boromir|faramir (explicit user choice). Auto-mode (force_
+        # provider is None — not addressed, not forced to cloud, not
+        # forced local to a specific persona) now also gets real voice,
+        # using the same prediction above. Forced-cloud addresses
+        # ("Groq, ...", "Cerebras, ...") deliberately still get generic
+        # framing — see build_system_prompt()'s docstring for why.
+        known_persona = force_provider if force_provider in ("boromir", "faramir") else None
+        persona_for_prompt = known_persona or (predicted_local_persona if force_provider is None else None)
+
+        # Per-persona step budget (2026-07-21, extended alongside voice
+        # 2026-07-22) — see _PERSONA_MAX_STEPS' comment for the reasoning
+        # and the deliberately mild numbers. Uses the same persona_for_
+        # prompt value as voice above, so a run that gets Boromir's voice
+        # also gets Boromir's step budget, never one without the other.
+        effective_max_steps = _PERSONA_MAX_STEPS.get(persona_for_prompt, config.MAX_AGENT_STEPS)
 
         # Fetched once, used two ways (2026-07-14, complexity-scoring fix
         # — see below and OLORIN_PROJECT.md Section 7/13). Previously
@@ -489,7 +634,8 @@ class Agent:
                 "role": "system",
                 "content": build_system_prompt(
                     self.repo_root, capsules=capsules, olorin_md=self.olorin_md,
-                    tools_available=not is_faramir,
+                    extra_repo_roots=self.extra_repo_roots,
+                    persona=persona_for_prompt,
                 ),
             },
             {"role": "user", "content": user_query},
@@ -547,7 +693,7 @@ class Agent:
         retrieved_files: set[str] = {m["module"] for m in capsules} if capsules else set()
         last_response = None
 
-        for step in range(config.MAX_AGENT_STEPS):
+        for step in range(effective_max_steps):
             logger.info(f"step={step + 1} | sending {len(messages)} messages")
 
             response = self.llm.chat(
@@ -557,6 +703,7 @@ class Agent:
                 retrieved_chunks=retrieved_chunks,
                 retrieved_files=retrieved_files,
                 force_provider=force_provider,
+                local_persona_hint=predicted_local_persona,
             )
 
             last_response = response
@@ -600,6 +747,7 @@ class Agent:
                         tool_name=tool_call["name"],
                         arguments=arguments,
                         repo_root=self.repo_root,
+                        extra_repo_roots=self.extra_repo_roots,
                     )
                     self._accumulate_retrieved_chunks(result, retrieved_chunks, retrieved_files)
 
@@ -621,7 +769,8 @@ class Agent:
                         "role": "system",
                         "content": build_system_prompt(
                             self.repo_root, capsules=None, olorin_md=self.olorin_md,
-                            tools_available=not is_faramir,
+                            extra_repo_roots=self.extra_repo_roots,
+                            persona=persona_for_prompt,
                         ),
                     }
 
@@ -637,7 +786,7 @@ class Agent:
             self._log_conversation(original_query, answer, tools_used, last_response)
             return answer
 
-        logger.warning(f"Max steps ({config.MAX_AGENT_STEPS}) reached without final answer.")
+        logger.warning(f"Max steps ({effective_max_steps}) reached without final answer.")
         answer = "Max reasoning steps reached without a final answer."
         self._log_conversation(original_query, answer, tools_used, last_response)
         return answer

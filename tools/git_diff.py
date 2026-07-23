@@ -114,6 +114,44 @@ def _split_diff_by_file(diff_text: str) -> list[dict]:
     return chunks
 
 
+def _uncommitted_changes_note(repo_root: str, ref: str) -> str | None:
+    """
+    Structural honesty check, added 2026-07-22 (OLORIN_PROJECT.md
+    Section 13's V4 entries) after a real, diagnosed wrong-answer: a
+    tightened tool-prompt description alone ('prefer no ref for what-
+    changed-today questions') is soft instruction a model can still
+    override, and did, live. Rather than word the prompt harder for
+    diminishing returns, this makes the RESULT itself say something when
+    a supplied ref would silently exclude real uncommitted work — same
+    "honest partial result over a silently incomplete one" posture this
+    project applies everywhere else (search_codebase's not-indexed
+    message, web_search's unconfigured message), just triggered here by
+    the model's own tool-call choice rather than by missing data.
+
+    Only fires for a two-dot-or-more range ("A..B", "A...B") — a plain
+    single ref (e.g. "HEAD~1") genuinely does diff against the CURRENT
+    working tree too (git's own semantics), so it already shows
+    uncommitted work and needs no caveat; only an explicit range fully
+    excludes it. Best-effort: `git status --porcelain` failing here must
+    never break the diff result itself, only the note is skipped.
+    """
+    if ".." not in ref:
+        return None
+    try:
+        status_output = _run_git(["status", "--porcelain"], repo_root)
+    except GitError:
+        return None
+    changed = [line for line in status_output.splitlines() if line.strip()]
+    if not changed:
+        return None
+    return (
+        f"{len(changed)} file(s) have uncommitted changes NOT included in "
+        f"this diff, because a specific ref/range ('{ref}') was requested "
+        "instead of the default. Call git_diff with no ref to see the "
+        "current uncommitted state."
+    )
+
+
 def git_diff(repo_root: str, ref: str | None = None, max_chars: int = 20000) -> dict:
     """
     Explains what changed, via `git diff`.
@@ -145,7 +183,9 @@ def git_diff(repo_root: str, ref: str | None = None, max_chars: int = 20000) -> 
         (git's own `--stat` summary) is always included in full
         regardless of "truncated" — even when the unified diff itself
         gets cut off, the agent still knows the complete scope of what
-        changed.
+        changed. A "note" key (added 2026-07-22) is present when a
+        supplied range ref excludes real uncommitted changes — see
+        _uncommitted_changes_note()'s docstring.
     """
     if ref:
         try:
@@ -161,6 +201,8 @@ def git_diff(repo_root: str, ref: str | None = None, max_chars: int = 20000) -> 
         diff_output = _run_git(["diff", diff_ref, "--"], repo_root)
     except GitError as e:
         return {"error": str(e)}
+
+    note = _uncommitted_changes_note(repo_root, ref) if ref else None
 
     all_chunks = _split_diff_by_file(diff_output)
     total_files = len(all_chunks)
@@ -185,7 +227,7 @@ def git_diff(repo_root: str, ref: str | None = None, max_chars: int = 20000) -> 
         shown_chunks.append(c)
         running_total += len(c["content"])
 
-    return {
+    result = {
         "ref": ref_display,
         "stat": stat_output.strip()[:_MAX_STAT_CHARS] or "(no changes)",
         "chunks": shown_chunks,
@@ -193,6 +235,9 @@ def git_diff(repo_root: str, ref: str | None = None, max_chars: int = 20000) -> 
         "files_shown": len(shown_chunks),
         "truncated": len(shown_chunks) < total_files,
     }
+    if note:
+        result["note"] = note
+    return result
 
 
 if __name__ == "__main__":
@@ -226,3 +271,24 @@ if __name__ == "__main__":
     result = git_diff("/tmp")
     print(result)
     assert "error" in result
+
+    print("\n--- git_diff(two-dot range, note check) ---")
+    # Direct, LLM-free check of the 2026-07-22 honesty fix
+    # (_uncommitted_changes_note) — verifies the tool's OWN result
+    # carries the caveat, decoupled from whether a local model chooses
+    # to narrate it in a synthesized final answer (it isn't guaranteed
+    # to — that's exactly the risk this structural fix exists for).
+    # Only meaningful with real uncommitted changes present when run;
+    # prints a clear message either way rather than asserting blindly.
+    result = git_diff(test_root, ref="HEAD~1..HEAD")
+    if "error" in result:
+        print(f"Error: {result['error']}")
+    elif "note" in result:
+        print(f"note PRESENT: {result['note']}")
+    else:
+        print(
+            "note ABSENT — either there are no real uncommitted changes "
+            "right now (expected, nothing to flag), or the fix isn't "
+            "firing (worth checking git status --porcelain by hand if "
+            "you know there SHOULD be uncommitted changes)."
+        )

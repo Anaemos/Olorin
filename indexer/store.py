@@ -194,6 +194,70 @@ def query(collection: chromadb.Collection, query_text: str, n_results: int = 5) 
     return results
 
 
+def query_multi(repo_paths: list[str], query_text: str, n_results: int = 5) -> list[dict]:
+    """
+    Cross-repo semantic search (V3, "cross-repo querying", Section 11).
+
+    Queries each repo's own Chroma collection independently, then merges
+    and re-ranks results GLOBALLY by raw distance — a real design
+    decision, not the only option (a fixed top-N-per-repo quota was
+    considered and deliberately rejected): a query heavily relevant to
+    one repo and barely relevant to another should surface mostly (or
+    entirely) the relevant repo's chunks, rather than artificially
+    padding results from an unrelated repo just to guarantee
+    representation.
+
+    Comparing distances across genuinely different Chroma collections is
+    only valid because every collection in this project shares the same
+    embedding model (bge-small-en-v1.5, indexer/embedder.py) and the same
+    distance metric (Chroma's default HNSW space — get_collection() never
+    overrides it per-collection). This is an explicit assumption worth
+    naming, not an incidental fact: if a future version ever let
+    different repos use different embedding models, this function's
+    cross-collection sort would silently become meaningless, comparing
+    numbers from two different spaces as if they meant the same thing.
+
+    The query is embedded ONCE and reused across every collection's raw
+    .query() call, not once per repo — avoids N redundant GPU embedding
+    calls for what is, from the embedding model's perspective, the exact
+    same input every time.
+
+    Repos with an empty (not-yet-indexed) collection are silently
+    skipped, not treated as an error — a multi-repo query where only
+    some repos happen to be indexed should still return what it can from
+    the ones that are, the same "honest partial result over an all-or-
+    nothing failure" posture as every other tool in this project.
+
+    Each result dict carries its "repo" field inside "metadata" (already
+    stored per-chunk by upsert_chunks() — Section 8's chunk contract),
+    so a merged, cross-repo result list is still attributable to the
+    repo each chunk actually came from.
+    """
+    query_embedding = embed_query(query_text)
+
+    all_results: list[dict] = []
+    for repo_path in repo_paths:
+        collection = get_collection(repo_path)
+        if collection.count() == 0:
+            continue  # not indexed yet — skip silently, not an error
+
+        with profiling.span("vector_search"):
+            raw = collection.query(
+                query_embeddings=[query_embedding],
+                n_results=n_results,
+                include=["documents", "metadatas", "distances"],
+            )
+
+        documents = raw.get("documents") or [[]]
+        metadatas = raw.get("metadatas") or [[]]
+        distances = raw.get("distances") or [[]]
+        for content, metadata, distance in zip(documents[0], metadatas[0], distances[0]):
+            all_results.append({"content": content, "metadata": metadata, "distance": distance})
+
+    all_results.sort(key=lambda r: r["distance"])
+    return all_results[:n_results]
+
+
 if __name__ == "__main__":
     # Smoke test: python -m indexer.store
     # Chunks + embeds core/agent.py for real (using the actual chunker

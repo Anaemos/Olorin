@@ -47,9 +47,55 @@ class ProviderError(Exception):
     (e.g. rate limit, timeout, connection refused). LLMClient catches this
     to decide whether to trip the circuit breaker and fall back."""
 
-    def __init__(self, message: str, is_rate_limit: bool = False):
+    def __init__(self, message: str, is_rate_limit: bool = False, is_daily_quota: bool = False):
         super().__init__(message)
         self.is_rate_limit = is_rate_limit
+        # is_daily_quota (added 2026-07-19): a real gap found live — Groq
+        # returns HTTP 413 (not 429) for "request would exceed remaining
+        # daily token budget," which the openai SDK maps to a generic
+        # APIStatusError, not RateLimitError, so this condition was
+        # previously falling into a provider's catch-all exception
+        # handler with is_rate_limit=False entirely, meaning it NEVER
+        # tripped the circuit breaker. A daily quota also doesn't recover
+        # in the standard 5-minute cooldown a per-minute limit would, so
+        # even once correctly classified as a rate limit, it needs a
+        # different (much longer) cooldown — see classify_quota_error()
+        # below and config.DAILY_QUOTA_COOLDOWN_MINUTES.
+        self.is_daily_quota = is_daily_quota
+
+
+def classify_quota_error(message: str) -> tuple[bool, bool]:
+    """
+    Inspects a provider error message and returns (is_rate_limit,
+    is_daily_quota) — shared between groq_provider.py and
+    cerebras_provider.py so both classify quota-related failures the
+    same way, rather than duplicating (and potentially drifting) the
+    same keyword logic in two places.
+
+    Content-based, not status-code-based, deliberately: the same
+    underlying condition (a token/request budget exceeded) can surface
+    as different HTTP status codes depending on provider and specific
+    limit type — Groq's daily-budget case is a 413, its per-minute case
+    is a 429; relying on status code alone would miss the 413 case
+    exactly the way this project's code originally did, live, in
+    production, before this function existed. Matched against Groq's and
+    Cerebras's REAL observed error message shapes (both logged verbatim
+    in OLORIN_PROJECT.md Section 13), not guessed at.
+    """
+    lowered = message.lower()
+    is_quota_related = (
+        "rate_limit_exceeded" in lowered
+        or "token_quota_exceeded" in lowered
+        or "quota" in lowered
+        or "rate limit" in lowered
+    )
+    is_daily = (
+        "tokens per day" in lowered
+        or "requests per day" in lowered
+        or " tpd" in lowered
+        or " rpd" in lowered
+    )
+    return is_quota_related, is_daily
 
 
 class BaseProvider(ABC):
@@ -68,6 +114,7 @@ class BaseProvider(ABC):
         messages: list,
         tools: Optional[list] = None,
         think_override: Optional[bool] = None,
+        options_override: Optional[dict] = None,
     ) -> ProviderResponse:
         """
         Send a chat completion request.
@@ -86,6 +133,18 @@ class BaseProvider(ABC):
                 provider/routing layers when that need actually arrives.
                 Providers that have no concept of thinking mode (Groq)
                 accept and ignore this.
+            options_override: Per-call sampling parameters (temperature,
+                top_p, num_predict, repeat_penalty, etc.) — added
+                2026-07-21 alongside core/llm_client.py's per-persona
+                _PERSONA_PARAMS split (Boromir: low temperature/short
+                num_predict for fast, decisive execution; Faramir:
+                higher temperature/longer num_predict for genuine
+                exploration — see _call_local()'s docstring). Same
+                extension-point philosophy as think_override: providers
+                with no concept of per-call sampling overrides (Groq,
+                Cerebras — both cloud, single-persona, no local-model
+                notion of "which persona is this") accept and ignore
+                this.
 
         Returns:
             ProviderResponse — normalized regardless of backend.

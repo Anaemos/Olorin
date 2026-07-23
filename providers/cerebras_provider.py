@@ -40,7 +40,7 @@ import time
 from openai import APIConnectionError, APITimeoutError, OpenAI, RateLimitError
 
 import config
-from providers.base import BaseProvider, ProviderError, ProviderResponse
+from providers.base import BaseProvider, ProviderError, ProviderResponse, classify_quota_error
 
 CEREBRAS_BASE_URL = "https://api.cerebras.ai/v1"
 
@@ -77,10 +77,19 @@ class CerebrasProvider(BaseProvider):
         )
         self.model = config.CEREBRAS_MODEL
 
-    def chat(self, messages: list, tools: list | None = None, think_override: bool | None = None) -> ProviderResponse:
-        # think_override accepted for BaseProvider interface compatibility,
-        # no effect — Cerebras's hosted models have no thinking-mode
-        # concept to toggle here (same as Groq's chat(), see that file).
+    def chat(
+        self,
+        messages: list,
+        tools: list | None = None,
+        think_override: bool | None = None,
+        options_override: dict | None = None,
+    ) -> ProviderResponse:
+        # think_override/options_override accepted for BaseProvider
+        # interface compatibility, no effect — Cerebras's hosted models
+        # have no thinking-mode or per-persona sampling-override concept
+        # to apply here (options_override exists for core/llm_client.py's
+        # per-persona _PERSONA_PARAMS, which only ever targets the local
+        # provider; same as groq_provider.py, see that file).
         start = time.monotonic()
         try:
             kwargs = {"model": self.model, "messages": messages}
@@ -90,12 +99,17 @@ class CerebrasProvider(BaseProvider):
             response = self.client.chat.completions.create(**kwargs)
 
         except RateLimitError as e:
-            # Covers both a real 429 and (per Cerebras's docs) daily-
-            # token-quota exhaustion, which surfaces the same way —
-            # treated identically to Groq's rate limit: trip this
-            # provider's own circuit breaker, don't retry it for a
-            # while.
-            raise ProviderError(f"Cerebras rate limit/quota hit: {e}", is_rate_limit=True)
+            # Covers both a real per-minute 429 and (per Cerebras's own
+            # docs) daily-token-quota exhaustion, which can surface the
+            # same way. classify_quota_error() (providers/base.py, added
+            # 2026-07-19 after finding Groq never distinguished this
+            # either) inspects the message content to tell which one this
+            # actually is — core/llm_client.py uses is_daily_quota to pick
+            # a much longer circuit-breaker cooldown for the daily case,
+            # since it won't recover in the standard 5-minute window a
+            # per-minute limit would.
+            _, is_daily = classify_quota_error(str(e))
+            raise ProviderError(f"Cerebras rate limit/quota hit: {e}", is_rate_limit=True, is_daily_quota=is_daily)
         except (APIConnectionError, APITimeoutError) as e:
             raise ProviderError(f"Cerebras unreachable: {e}", is_rate_limit=False)
         except Exception as e:
