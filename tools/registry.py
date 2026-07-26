@@ -15,6 +15,7 @@ within this one module: add the schema, add a dispatch branch.
 
 import json
 
+from tools.crawl import crawl_page
 from tools.entities import search_entities
 from tools.git_diff import git_diff
 from tools.history import search_history
@@ -225,6 +226,35 @@ TOOL_SCHEMAS = [
     {
         "type": "function",
         "function": {
+            "name": "crawl_page",
+            "description": (
+                "Fetches ONE specific web page and returns its real "
+                "content as markdown — use this when web_search's "
+                "snippets aren't enough and you need the actual full "
+                "content of a page you already have (or were given) a "
+                "URL for, e.g. following a link from a web_search "
+                "result, or reading a specific doc/article the user "
+                "linked. Not a search tool — you need a real URL first "
+                "(get one from web_search if you don't have one). Only "
+                "http/https URLs are allowed; private/internal "
+                "addresses are refused. Returns an error for an invalid "
+                "URL, an unreachable site, or a timeout."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "url": {
+                        "type": "string",
+                        "description": "The full URL to fetch, e.g. 'https://example.com/docs/page'.",
+                    },
+                },
+                "required": ["url"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "list_files",
             "description": (
                 "List files in the repository matching a glob pattern "
@@ -262,7 +292,7 @@ def execute_tool(
     Args:
         tool_name: One of "search_codebase", "search_history", "search_entities",
                    "read_file", "list_files", "web_search", "file_importance",
-                   "git_diff".
+                   "git_diff", "crawl_page".
         arguments: Parsed arguments dict (already json.loads'd from the
                    provider's raw tool_call.arguments string by the caller).
         repo_root: Absolute path to the primary repo being queried —
@@ -314,6 +344,12 @@ def execute_tool(
 
     if tool_name == "git_diff":
         return git_diff(repo_root=repo_root, ref=arguments.get("ref") or None)
+
+    if tool_name == "crawl_page":
+        # repo_root unused, same deliberate reason as web_search below —
+        # crawl_page has no repo scope, accepted anyway for execute_tool()'s
+        # uniform dispatch signature.
+        return crawl_page(repo_root=repo_root, url=arguments.get("url", ""))
 
     if tool_name == "web_search":
         # repo_root deliberately unused here, unlike every other tool —

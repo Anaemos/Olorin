@@ -66,6 +66,28 @@ def get_collection(repo_path: str) -> chromadb.Collection:
     )
 
 
+def collection_exists(repo_path: str) -> bool:
+    """
+    Read-only existence check — unlike get_collection(), this NEVER
+    creates a collection as a side effect. get_or_create_collection()
+    means get_collection(x).count() > 0 as an "is this a known repo?"
+    probe silently litters the shared Chroma store with a permanent
+    empty collection for every directory anyone ever happens to run
+    `ask` from, even one that was never meant to be indexed (home
+    directory, a random script's cwd). Added for cli.py's context-
+    inheritance fallback (V4, 2026-07-23), which needs to answer "is
+    this a real, previously-indexed repo" without that answer itself
+    being a write.
+    """
+    client = get_client()
+    name = _collection_name(repo_path)
+    try:
+        client.get_collection(name=name)
+        return True
+    except Exception:
+        return False
+
+
 def _chunk_id(chunk: dict) -> str:
     """Stable ID for a chunk, derived from its location (file + line
     range), NOT its content. This is what makes re-indexing an
