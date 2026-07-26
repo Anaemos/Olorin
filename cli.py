@@ -114,6 +114,13 @@ def index(path: str = typer.Argument(..., help="Path to the repo to index.")):
 
     _index_repo(repo_path, verbose=True)
 
+    # Context inheritance (V4, 2026-07-23) — see memory/session_state.py's
+    # module docstring. Explicitly indexing a repo is real "I'm working
+    # on this project" activity, same as a successful `ask`, so it
+    # updates the same global pointer `ask`'s fallback reads from.
+    from memory import session_state
+    session_state.set_last_active_repo(repo_path)
+
 
 def _index_repo(repo_path: str, verbose: bool = True) -> dict:
     """
@@ -322,7 +329,16 @@ def _index_repo(repo_path: str, verbose: bool = True) -> dict:
 @app.command()
 def ask(
     query: str = typer.Argument(..., help="Your question about the codebase."),
-    path: str = typer.Option(".", "--path", "-p", help="Repo root to query."),
+    path: str | None = typer.Option(
+        None, "--path", "-p",
+        help=(
+            "Repo root to query. Defaults to the current directory; if "
+            "that directory hasn't been indexed yet and has no OLORIN.md, "
+            "falls back to your last active project instead (V4, context "
+            "inheritance — see memory/session_state.py). An explicit "
+            "--path always overrides both."
+        ),
+    ),
     repos: str = typer.Option(
         None, "--repos",
         help=(
@@ -379,10 +395,58 @@ def ask(
         from core.agent import Agent
     from core.llm_client import select_local_specialist
 
-    repo_path = os.path.abspath(path)
+    # Context inheritance / auto-switch on repo change (V4, 2026-07-23,
+    # memory/session_state.py). Only kicks in when --path wasn't passed
+    # explicitly — an explicit --path always wins outright, same
+    # "explicit flag beats an inferred default" precedent as direct-
+    # address routing (Section 7) and --force-local's specialist choice
+    # (Section 13, 2026-07-21). `ask` already defaulted --path to ".",
+    # so cd-into-repo-and-ask already worked before this — the real gap
+    # this closes is narrower: what happens when the CURRENT directory
+    # ISN'T the repo you mean (you're in ~, or a future no-cwd surface
+    # like a system tray icon). In that case, fall back to whatever repo
+    # was last active instead of silently trying to index/query wherever
+    # you happen to be standing.
+    from memory import session_state
+
+    path_was_explicit = path is not None
+    repo_path = os.path.abspath(path) if path_was_explicit else os.path.abspath(os.getcwd())
+
+    if not path_was_explicit:
+        from indexer.store import collection_exists
+
+        looks_like_known_repo = (
+            os.path.isfile(os.path.join(repo_path, "OLORIN.md"))
+            or collection_exists(repo_path)
+        )
+        if not looks_like_known_repo:
+            last_repo = session_state.get_last_active_repo()
+            if last_repo and os.path.isdir(last_repo):
+                typer.secho(
+                    f"No project specified, and this directory hasn't been "
+                    f"indexed — resuming last active project: {last_repo} "
+                    f"(cd there, or pass --path, to use something else).",
+                    fg=typer.colors.CYAN,
+                )
+                repo_path = last_repo
+            # else: no prior session AND this directory looks unfamiliar
+            # — fall through with cwd anyway, same honest handling
+            # index-on-demand already gives any never-before-seen repo.
+
     if not os.path.isdir(repo_path):
         typer.secho(f"Not a directory: {repo_path}", fg=typer.colors.RED)
         raise typer.Exit(code=1)
+
+    # Honest breadcrumb, not just for the fallback case above — also
+    # fires on an ordinary explicit --path to a different repo than last
+    # time. Silent when there's no prior session (nothing to compare
+    # against) or the repo didn't actually change (including the
+    # fallback case itself, where repo_path now equals last_repo by
+    # construction, so this deliberately does not double-announce it).
+    previous_active = session_state.get_last_active_repo()
+    if previous_active and previous_active != repo_path:
+        typer.secho(f"Switched context: {previous_active} -> {repo_path}", fg=typer.colors.CYAN)
+    session_state.set_last_active_repo(repo_path)
 
     # Cross-repo querying (V3, "cross-repo querying", Section 11): each
     # extra repo is validated up front, the same way the primary --path

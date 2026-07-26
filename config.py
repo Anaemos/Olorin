@@ -94,7 +94,24 @@ OLLAMA_API_KEY = "ollama-local-no-key-required"
 
 # --- Cloud model name -----------------------------------------------------
 
-GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
+# Switched 2026-07-25 from llama-3.3-70b-versatile to openai/gpt-oss-120b
+# (see OLORIN_PROJECT.md Section 13 for the full story). Two independent
+# reasons converged the same day: (1) Groq officially deprecated
+# llama-3.3-70b-versatile on 2026-06-17, shutdown date 2026-08-16 — we
+# were inside that transition window, and Groq's own migration guidance
+# explicitly recommends openai/gpt-oss-120b or qwen/qwen3.6-27b for
+# "superior tool use capabilities... improved reliability." (2) A real,
+# in-project data point independent of Groq's own claim: every malformed-
+# tool-call failure this project has EVER logged (bugs #10, #14, #18, and
+# a whole session's worth on 2026-07-25) was llama-3.3-70b-versatile;
+# Cerebras — which already runs gpt-oss-120b, one of Groq's own
+# recommended replacements — has never once thrown this error in this
+# project's history. Picked gpt-oss-120b over qwen/qwen3.6-27b
+# specifically because this project already has live, working evidence
+# of gpt-oss-120b's tool-calling reliability via Cerebras, rather than a
+# second unknown model. Still fully env-overridable — same escape hatch
+# as CEREBRAS_MODEL if this default ever needs to change again.
+GROQ_MODEL = os.getenv("GROQ_MODEL", "openai/gpt-oss-120b")
 
 
 # --- Routing / complexity scorer -------------------------------------------

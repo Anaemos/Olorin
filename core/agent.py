@@ -329,7 +329,7 @@ def build_system_prompt(
         )
 
     tools_section = (
-        "You have eight tools available:\n"
+        "You have nine tools available:\n"
         "- search_codebase: semantic search over the indexed codebase — "
         "try this first for conceptual/\"how does X work\" questions. If "
         "the repo hasn't been indexed yet, it'll tell you so.\n"
@@ -356,7 +356,12 @@ def build_system_prompt(
         "- web_search: search the live web for current information "
         "outside this codebase and outside your training data (current "
         "events, library versions, anything time-sensitive) — use it "
-        "instead of guessing when a question needs up-to-date facts\n\n"
+        "instead of guessing when a question needs up-to-date facts\n"
+        "- crawl_page: fetch ONE specific web page (given a real URL) "
+        "and return its actual content, when a web_search snippet isn't "
+        "enough — e.g. following a link from a search result or reading "
+        "a page the user linked directly. Requires a URL, not a query "
+        "— use web_search first if you don't have one.\n\n"
         "When asked about the codebase, ground your answer in the actual "
         "code rather than guessing — use search_codebase to find relevant "
         "chunks, falling back to list_files/read_file if search isn't "
