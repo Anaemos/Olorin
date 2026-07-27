@@ -1,0 +1,31 @@
+name: Release indexer_core
+
+on:
+  push:
+    tags:
+      - "indexer_core-v*"
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Build (release)
+        working-directory: indexer_core
+        run: cargo build --release
+
+      - name: Package
+        shell: pwsh
+        run: |
+          Copy-Item indexer_core\target\release\indexer_core.exe indexer_core.exe
+          $hash = (Get-FileHash indexer_core.exe -Algorithm SHA256).Hash
+          "$hash  indexer_core.exe" | Out-File -Encoding ascii indexer_core.exe.sha256
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            indexer_core.exe
+            indexer_core.exe.sha256
