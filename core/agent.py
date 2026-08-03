@@ -411,6 +411,21 @@ class Agent:
         self.olorin_md = load_olorin_md(repo_root)
         self.extra_repo_roots = extra_repo_roots or []
 
+        # Exposed metadata from the most recent run() call -- added so
+        # callers (server/app.py, specifically the richer /ask/stream
+        # "done" event) can report real backend/complexity/token info
+        # without run()'s return type changing. All the underlying data
+        # was already computed internally for _log_conversation()/
+        # _extract_entities(); this just also keeps it accessible after
+        # the call returns, via a small _record_run_metadata() step at
+        # each of run()'s three return points.
+        self.last_backend_used: str | None = None
+        self.last_provider: str | None = None
+        self.last_model: str | None = None
+        self.last_complexity_score: int | None = None
+        self.last_input_tokens: int | None = None
+        self.last_output_tokens: int | None = None
+
     def _accumulate_retrieved_chunks(
         self,
         tool_result: dict,
@@ -490,6 +505,24 @@ class Agent:
             last_response.model if last_response.provider == "ollama"
             else last_response.provider
         )
+
+    def _record_run_metadata(self, last_response) -> None:
+        """
+        Populates the self.last_* attributes declared in __init__ (see
+        their comment there for why they exist) from the final
+        ProviderResponse of a run. Called once at each of run()'s three
+        return points, right alongside the existing _log_conversation()/
+        _extract_entities() calls those points already make — same
+        "real data from the response that just happened" source, just
+        also kept accessible to the caller after run() returns.
+        """
+        self.last_backend_used = self._backend_used(last_response)
+        if last_response is not None:
+            self.last_provider = last_response.provider
+            self.last_model = last_response.model
+            self.last_complexity_score = last_response.complexity_score
+            self.last_input_tokens = last_response.input_tokens
+            self.last_output_tokens = last_response.output_tokens
 
     def _log_conversation(
         self,
@@ -715,6 +748,7 @@ class Agent:
 
             if response.finish_reason == "stop":
                 logger.info(f"step={step + 1} | final answer from {response.provider}")
+                self._record_run_metadata(last_response)
                 self._log_conversation(original_query, response.content, tools_used, last_response)
                 self._extract_entities(original_query, response.content, last_response)
                 return response.content
@@ -788,11 +822,13 @@ class Agent:
             # silently looping forever on an unrecognized finish_reason.
             logger.warning(f"Unexpected finish_reason: {response.finish_reason}")
             answer = response.content or "No answer produced."
+            self._record_run_metadata(last_response)
             self._log_conversation(original_query, answer, tools_used, last_response)
             return answer
 
         logger.warning(f"Max steps ({effective_max_steps}) reached without final answer.")
         answer = "Max reasoning steps reached without a final answer."
+        self._record_run_metadata(last_response)
         self._log_conversation(original_query, answer, tools_used, last_response)
         return answer
 

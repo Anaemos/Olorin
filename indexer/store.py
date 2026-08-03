@@ -162,8 +162,31 @@ def upsert_chunks(collection: chromadb.Collection, chunks: list[dict]) -> int:
         for c in chunks
     ]
 
-    collection.upsert(ids=ids, embeddings=embeddings, documents=documents, metadatas=metadatas)
-    return len(chunks)
+    # Real bug found live (2026-07-2x): Chroma's SQLite-backed client
+    # enforces a hard cap on items per upsert() call -- exceeding it
+    # isn't a soft warning, it's a ValueError that aborts the ENTIRE
+    # call, none of the batch gets written. First surfaced once this
+    # repo's own accumulated docs (ENGINEERING_JOURNAL* archives,
+    # OLORIN_PROJECT.md) pushed a single reindex run's total chunk count
+    # past the limit for the first time -- no earlier session's indexing
+    # run had ever produced enough chunks in one call to hit it. Fixed by
+    # asking Chroma's own client for its actual current limit
+    # (get_max_batch_size(), a real public method as of chromadb 1.x --
+    # NOT hardcoding a guessed constant, since this cap is derived from
+    # the underlying SQLite build's own parameter-count limit and isn't
+    # guaranteed stable across Chroma/SQLite versions) and slicing the
+    # upsert into sequential sub-batches at or under it.
+    max_batch = get_client().get_max_batch_size()
+    total = len(ids)
+    for start in range(0, total, max_batch):
+        end = min(start + max_batch, total)
+        collection.upsert(
+            ids=ids[start:end],
+            embeddings=embeddings[start:end],
+            documents=documents[start:end],
+            metadatas=metadatas[start:end],
+        )
+    return total
 
 
 def delete_file(collection: chromadb.Collection, file_path: str) -> None:

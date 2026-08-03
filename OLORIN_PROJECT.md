@@ -21,20 +21,37 @@ A system with real architectural decisions at every level: provider abstraction,
 | Agent | Model | Role | Lore |
 |---|---|---|---|
 | **Olorin** | Groq `openai/gpt-oss-120b` (switched 2026-07-25 from `llama-3.3-70b-versatile`, deprecated by Groq — see Section 13) | Frontier brain, orchestrator, online | Gandalf's true form — ancient, all-knowing, dispatches the others |
-| **Faramir** | Ollama `deepseek-r1:8b` | Reasoning, scholar, planning, knowledge | The studious brother — reads books, thinks before acting, strategic |
-| **Boromir** | Ollama `qwen3:8b` (`think: false`) | Code, tools, execution, fast responses | The warrior — direct, task-focused, gets things done |
+| **Faramir** | Ollama `local:latest` (`FROM qwen3:8b`, `think: true`) | Reasoning, scholar, planning, knowledge | The studious brother — reads books, thinks before acting, strategic |
+| **Boromir** | Ollama `local:latest` (`FROM qwen3:8b`, `think: false`) | Code, tools, execution, fast responses | The warrior — direct, task-focused, gets things done |
 
-**Note on shared lineage (added 2026-07-09):** Faramir and Boromir both
-report `architecture: qwen3` via `ollama show` — not a mistake. DeepSeek's
-`deepseek-r1:8b` distill is R1's reasoning traces trained onto a Qwen3
-base, so the two share ancestry. They remain meaningfully distinct models,
-not the same weights twice: different license (MIT/DeepSeek vs. Apache
-2.0/Qwen), different chat-template stop tokens (DeepSeek/R1 convention vs.
-ChatML), different reported max context (131072 vs. 40960), and — the
-functionally important one — Boromir runs with `think: false` (fast,
-task-focused execution, per its role above) while Faramir runs with
-`think: true` (reasoning is the point). See `providers/ollama_provider.py`
-and `core/llm_client.py` for where that's actually enforced.
+**Updated 2026-07-27 (doc staleness flagged 2026-07-25, fixed now — V5
+Phase 0 cleanup):** this table described Faramir and Boromir as two
+separate named Ollama models (`faramir` FROM `deepseek-r1:8b`, `boromir`
+FROM `qwen3:8b`) through V3. That stopped being true on 2026-07-20 (V4's
+specialist-routing entry, Section 13) — both personas were collapsed
+onto ONE loaded model, `local:latest` (`FROM qwen3:8b`, `num_ctx 16384`),
+differentiated entirely at the application layer: the `think` request
+flag, per-persona sampling params, and real behavioral voice text in the
+system prompt (`core/agent.py`'s `_PERSONA_VOICE`) — not by loading
+different weights. `deepseek-r1:8b` and the separate `faramir`/`boromir`
+Ollama tags are no longer referenced by anything in this codebase. The
+original "shared lineage" note below is kept for its historical record
+(it's what motivated the collapse in the first place — once both
+personas' tool-calling reliability could come from the same qwen3 base,
+keeping DeepSeek-R1 around just for `<think>` traces stopped paying for
+itself), not as a description of the current setup.
+
+**Original note on shared lineage (2026-07-09, pre-collapse):** Faramir
+and Boromir both reported `architecture: qwen3` via `ollama show` back
+when they were still two separate named models — not a mistake.
+DeepSeek's `deepseek-r1:8b` distill is R1's reasoning traces trained onto
+a Qwen3 base, so the shared label was real ancestry. At the time they
+remained meaningfully distinct models: different license (MIT/DeepSeek
+vs. Apache 2.0/Qwen), different chat-template stop tokens (DeepSeek/R1
+convention vs. ChatML), different reported max context (131072 vs.
+40960). This distinction is now moot post-collapse — see the update
+above and Section 13's 2026-07-20 entry for the full story of why one
+model ended up being enough.
 
 **Routing logic:**
 - Complex reasoning, architecture, planning, multi-step analysis → **Olorin (Groq)**
@@ -54,26 +71,35 @@ and `core/llm_client.py` for where that's actually enforced.
 | CPU | AMD Ryzen 7 7840HS |
 | OS | Windows |
 
-**VRAM budget:**
-- Boromir (qwen3:8b-q4_K_M): ~5.2GB
-- Faramir (deepseek-r1:8b): ~5.2GB
+**VRAM budget (updated 2026-07-27 for the 2026-07-20 model collapse —
+see Section 2/13):**
+- `local:latest` (qwen3:8b-based, serves BOTH Boromir and Faramir personas — one loaded checkpoint, not two): ~5.2GB
 - bge-small-en-v1.5 during GPU embedding: +0.3GB
-- Peak usage: ~5.5GB — well within 8GB ceiling
+- Peak usage: ~5.5GB — well within 8GB ceiling (this number was already accurate pre-collapse too, since only one local model was ever loaded into VRAM at a time even when Boromir/Faramir were separate named models — see "Key rule" above)
 
-**Storage estimate:**
-- Boromir model: ~5.2GB
-- Faramir model: ~5.2GB
+**Storage estimate (updated 2026-07-27 — this one WAS wrong pre-fix, not
+just stale wording: it double-counted a model that's now genuinely one
+file on disk, not two):**
+- `local:latest` model (single qwen3:8b-based checkpoint, serves both personas): ~5.2GB
 - bge-small embedding model: ~130MB
 - ChromaDB index (per repo): 50–200MB
 - SQLite memory DB: 10–50MB
 - Python deps + Rust binary: ~2–3GB
-- **Total: ~13–14GB**
+- **Total: ~8–9GB** (down from the pre-collapse ~13–14GB estimate, which assumed two separate 5.2GB local models)
 
 ---
 
 ## 4. Ollama Model Setup
 
-### Boromir
+**Updated 2026-07-27 for the 2026-07-20 model collapse (Section 2/13) —
+this section previously walked through creating two separate named
+models (`boromir`, `faramir`). That's no longer how this works: both
+personas now run on ONE loaded checkpoint, `local:latest`, differentiated
+at the application layer (the `think` request flag, per-persona sampling
+params, and system-prompt voice text — all in `core/llm_client.py`/
+`core/agent.py`, none of it a Modelfile concern).**
+
+### `local:latest` (serves both Boromir and Faramir)
 ```bash
 # Base model (switched from qwen2.5-coder 2026-07-09 — see
 # ENGINEERING_JOURNAL.md and OLORIN_PROJECT.md Section 13 for why:
@@ -82,34 +108,28 @@ and `core/llm_client.py` for where that's actually enforced.
 ollama pull qwen3:8b
 
 # Create Modelfile
-ollama show qwen3:8b --modelfile > boromir.modelfile
+ollama show qwen3:8b --modelfile > local.modelfile
 # Add to modelfile after FROM line:
 # PARAMETER num_ctx 16384
-ollama create boromir -f boromir.modelfile
+ollama create local:latest -f local.modelfile
 ```
-Note: `think: false` (fast, non-deliberative tool execution — see Section
-2's lore table) is NOT set via the Modelfile — `think` is a per-request
-API field, not a Modelfile `PARAMETER`. It's set in code, in
-`core/llm_client.py`'s `OllamaProvider(config.BOROMIR_MODEL, think=False)`
-construction.
-
-### Faramir
-```bash
-ollama pull deepseek-r1:8b
-ollama show deepseek-r1:8b --modelfile > faramir.modelfile
-# Add to modelfile after FROM line:
-# PARAMETER num_ctx 16384
-ollama create faramir -f faramir.modelfile
-```
+Note: `think: true`/`think: false` (Faramir vs. Boromir — see Section 2's
+lore table) is NOT set via the Modelfile — `think` is a per-request API
+field, not a Modelfile `PARAMETER`. It's set in code, per call, in
+`core/llm_client.py` (`OllamaProvider(config.LOCAL_MODEL, think=...)`
+construction / `think_override` per persona) — the same single loaded
+model answers as either persona depending on what a given request asks
+for, not two separate models.
 
 ### Verify
 ```bash
 ollama list
-# Should show: boromir:latest, faramir:latest
-# Plus base models (keep them — olorin/boromir/faramir depend on them as FROM references)
+# Should show: local:latest
+# Plus the base qwen3:8b model (keep it — local:latest depends on it via FROM)
 ```
 
-**Important:** Do NOT delete base models. The named models (`boromir`, `faramir`) reference them via `FROM`. Deleting the base breaks the named model.
+**Important:** Do NOT delete the base `qwen3:8b` model. `local:latest`
+references it via `FROM`. Deleting the base breaks `local:latest`.
 
 ---
 
@@ -1253,25 +1273,100 @@ redesigned around the next thing built on top of it.
 **Scope decided directly with Aryavart, 2026-07-26: ship both a repo/README track and a native `.exe`, not one instead of the other** — same pattern most real dev tools use (repo for people who want to read the code, installer for everyone else). **Docker deliberately excluded from Olorin's own packaging**, for the identical reason it was excluded from the searxNcrawl integration a few sessions earlier: Docker Desktop's WSL2 layer is a real, Windows-specific tax (up to 50% of system RAM allocatable to the VM by default, a documented history of `vmmem` not releasing memory cleanly) — bundling it into Olorin's packaging would recreate the exact friction that decision already avoided once.
 
 **Phase 0 — Environment hygiene (prerequisite for both ship targets)**
-- [ ] `requirements.txt`/`pyproject.toml` — freeze the actual working environment; today it's only reproducible via the original venv history on Aryavart's machine, a real gap for anyone else (including a future installer) trying to reproduce it
-- [ ] Prebuilt `indexer_core` Windows binary published via GitHub Releases — removes the Rust toolchain as a hard requirement for anyone just trying the repo
-- [ ] Small doc cleanup: Section 2/12's tables still describing pre-collapse separate Boromir/Faramir Ollama models (flagged 2026-07-25, not yet fixed)
+- [x] `requirements.txt` — DONE 2026-07-27, CORRECTED same day. First
+  version was a curated direct-dependency list (confirmed via a real
+  import audit, not `pip freeze`), reasoned as more honest than
+  freezing ~150 unrelated packages (jupyter, kubernetes, mcp, litellm,
+  keyring) that share this venv from other work. **Aryavart pushed back
+  directly, and was right to:** the roadmap item literally says "freeze
+  the actual working environment," and a full freeze reproduces a
+  known-working install byte-for-byte, including whatever transitive
+  version constraint made this exact combination work — the curated
+  version traded away the actual property this file exists for in
+  favor of readability nobody asked for. Replaced with Aryavart's real
+  `pip freeze` output verbatim, plus the two things freeze can't
+  capture on its own: a `--extra-index-url` line for torch's CUDA wheel,
+  and a comment noting `playwright install chromium` still needs to run
+  separately (not pip-installable). **Real bonus from the correction,
+  not just a wash:** the freeze captured `searxNcrawl`'s exact installed
+  commit as `-e git+https://github.com/DasDigitaleMomentum/searxNcrawl.git@7a02032c...`
+  (pip recording the local editable install's git remote + commit via
+  PEP 610 `direct_url.json`) — genuinely more reproducible than the
+  first version's "run `pip install -e ..\searxNcrawl`" comment, which
+  only worked given that exact local checkout on this exact machine.
+  **VERIFIED 2026-07-27**: installed clean via `setup.ps1` against a
+  fresh venv (Python 3.11 via the `py` launcher, see the `setup.ps1`
+  entry below) — torch resolved correctly as cp311+cu121, all ~250
+  packages installed successfully.
+- [x] Prebuilt `indexer_core` Windows binary published via GitHub Releases — DONE 2026-07-27.
+  `.github/workflows/release-indexer-core.yml`: triggers on a
+  `indexer_core-v*` tag push, builds `indexer_core.exe` on
+  `windows-latest` via `cargo build --release`, computes a SHA256
+  checksum (reusing the same `sha2`/`hex` crates the walker itself
+  already depends on for hash-based reindex-skip, Section 8), and
+  publishes both as release assets via `softprops/action-gh-release`.
+  **First real run failed** with "Resource not accessible by
+  integration" — GitHub's default `GITHUB_TOKEN` is read-only unless a
+  workflow explicitly requests write access, and `action-gh-release`
+  needs `contents: write` to create a release. Fixed by adding an
+  explicit `permissions: contents: write` block. **Re-run succeeded**:
+  `indexer_core-v0.1.0` published with `indexer_core.exe` and
+  `indexer_core.exe.sha256` as real release assets. Genuinely verified,
+  not just written — same bar as every other Phase 0/1 item this
+  session. **Phase 0 is now fully closed.**
+- [x] Small doc cleanup — DONE 2026-07-27. Section 2's lore table and
+  Section 12's tech-stack table both still described Faramir/Boromir as
+  two separate named Ollama models (`faramir` FROM `deepseek-r1:8b`,
+  `boromir` FROM `qwen3:8b`) — stale since the 2026-07-20 model collapse
+  (Section 13), flagged 2026-07-25 but not fixed until now. Both tables
+  updated to show `local:latest` (`FROM qwen3:8b`) with persona
+  differentiation explained inline; Section 2's original "shared
+  lineage" note kept but clearly marked as a pre-collapse historical
+  record rather than the current setup, so the reasoning that motivated
+  the collapse isn't lost.
 
 **Phase 1 — Repo/README track**
-- [ ] Rewritten `README.md`: real prerequisites (Python 3.11+, Ollama, optional CUDA GPU), a genuine quickstart, Section 14's recruiter framing
-- [ ] PowerShell setup script: venv creation → `pip install` → Ollama detection/pull → prompt for API keys and write `.env`
+- [x] Rewritten `README.md` — DONE 2026-07-27. Fixed the same
+  pre-collapse staleness found in `OLORIN_PROJECT.md` Section 2/12/3/4
+  (README's architecture paragraph still said `llama-3.3-70b-versatile`
+  and separate Boromir/Faramir models). Added a real Prerequisites
+  section (Python 3.11+, Ollama, Rust toolchain, optional CUDA GPU,
+  Groq key required/others optional), a genuine Quickstart (both
+  `setup.ps1` and the manual step-by-step, kept in sync with Section
+  4's corrected Ollama setup), and Section 14's recruiter framing quoted
+  directly rather than paraphrased. Benchmark table left untouched —
+  already accurate, still real numbers.
+- [x] PowerShell setup script (`setup.ps1`) — DONE 2026-07-27, VERIFIED
+  live the same day. venv creation → `pip install -r requirements.txt`
+  → Ollama detection + `local:latest` model setup → prompts for API
+  keys and writes `.env` → informational `indexer_core` build check.
+  Idempotent (checks before acting on every step). **Two real bugs found
+  and fixed by actually running it, not caught by review:** (1) the
+  script used em dashes, which Windows PowerShell 5.1 misreads as
+  mojibake without a BOM, breaking the parser outright — fixed by
+  rewriting the file plain-ASCII; (2) the script trusted whatever
+  `python` resolved to on PATH, which on this machine is now 3.14 (a
+  different install than the working venv's 3.11) — `torch==2.5.1+cu121`
+  has no 3.14 wheel, so this silently would have broken torch specifically
+  while ~250 other packages installed fine, an easy failure to misdiagnose
+  as a torch problem rather than a Python-version problem. Fixed by
+  preferring `py -3.11` (Windows py launcher) over bare `python`. **Third
+  re-run after both fixes completed clean end-to-end**: torch resolved as
+  cp311+cu121, all packages installed, `local:latest`/`.env` correctly
+  detected as already present and skipped rather than re-prompted. Genuinely
+  verified now, not just written.
 
 **Phase 2 — Olorin Server: a real, deliberately narrow revisit of the V1.5 daemon deferral, not a silent reopening of it.** The TUI genuinely changes the usage model V1.5 was scoped around — a one-shot CLI command paying a ~6–10s cold-start tax once per invocation is a very different situation from a live, multi-turn interactive session paying that tax on *every single message*. That's exactly the kind of "measured need" the original 2026-07-10 deferral said would justify revisiting the decision, so this is treated as a real re-opening, argued on its own merits, not assumed just because a TUI was requested.
 
 **A fuller design (session-scoped server + WebSocket streaming + an async-rewritten `Agent.run_stream()` event pipeline + explicit future-proofing for a desktop GUI/VSCode/JetBrains plugins) was proposed, reviewed, and deliberately scoped down.** Two real problems with the fuller version, reasoned through directly rather than accepted on the strength of its diagrams: (1) rewriting `Agent.run()` into an async event-emitting generator touches the single most load-bearing, most-tested code in the project — the exact code whose accumulated complexity was the reason the LangGraph migration was declined a few sessions earlier (Section 13, 2026-07-24) — for a benefit (progressive tool-call visibility) that hasn't been shown to be necessary yet; (2) designing the server around hypothetical future frontends (VSCode/JetBrains/desktop GUI) that aren't in any actual plan is the same "solutions looking for evidence" pattern already caught and rejected once for V4's ten-layer persona-separation redesign.
 
 **Decided instead: a session-scoped server (starts with the frontend, dies with it — not a background daemon), wrapping `Agent.run()` completely unmodified, over a plain synchronous request/response interface** (JSON over a local socket or a trivial HTTP endpoint — exact transport TBD at implementation time, deliberately not WebSocket by default). This fixes the one thing that's actually been measured — the per-invocation Python cold-start tax — without touching `Agent.run()`'s internals at all. Streaming (tool-call/progress events, most naturally SSE layered on top of this same synchronous call using events the logger already emits per step) is explicitly deferred until real TUI usage shows the synchronous "loading" experience is actually a problem worth solving, not built preemptively against a guess.
-- [ ] `server/` module: thin request/response wrapper around the existing `Agent`, session lifecycle only (start with frontend, clean shutdown) — no changes to `core/agent.py`'s internals
-- [ ] `cli.py`'s `ask` command migrated to talk to the same server, so there's exactly one backend entry point into `Agent.run()`, not two independently-maintained callers
+- [x] `server/` module: thin request/response wrapper around the existing `Agent`, session lifecycle only (start with frontend, clean shutdown) — no changes to `core/agent.py`'s internals. **WRITTEN 2026-07-27** (`server/app.py`): stdlib `http.server`, no new dependency (`fastapi` itself isn't actually in `requirements.txt` despite `starlette`/`uvicorn` being present as `mcp`/`fastmcp` transitive deps — checked before assuming it was available). `POST /ask` (query, optional path/repos/provider/force_local/skip_index), `GET /health`, `POST /shutdown` for a clean session-scoped exit. Bound to one primary repo passed at startup (`--path`) rather than reimplementing `cli.py ask`'s context-inheritance/session_state fallback — a deliberate scope narrowing for this first pass, since a TUI will always know which repo it's launched into. **VERIFIED LIVE 2026-07-27**: started via `python -m server.app --path`, `GET /health` returned the bound repo root correctly, `POST /ask` ran a real request end-to-end through the unmodified `Agent.run()` — index-on-demand, full ReAct loop (Faramir capsule regen → Groq routing → final answer), and entity extraction all fired exactly as they do through `cli.py ask`, confirming the wrapper adds nothing that changes `Agent`'s behavior. `POST /shutdown` returned its response and the server process exited cleanly afterward, confirming the session-scoped lifecycle (not a background daemon) actually works.
+- [x] `cli.py`'s `ask` command migrated to talk to the same server, so there's exactly one backend entry point into `Agent.run()`, not two independently-maintained callers. **WRITTEN 2026-07-27.** Not a hard requirement — `ask` stays a one-shot CLI command, so forcing every call through a server would regress the exact cold-start cost this server exists to fix. Instead: `_try_server_ask()` does a fast localhost health check (connection-refused returns near-instantly when nothing's listening, so the common no-server case pays negligible overhead) and, if a server IS reachable, routes the request through it via `POST /ask`; otherwise falls through silently to the existing direct in-process path, byte-for-byte unchanged. `--no-server` forces the direct path explicitly; `--profile` does so implicitly, since profiling measures this process's own cost, not a server sitting in a different one. **VERIFIED LIVE 2026-07-27**, both cases: with no server running, `ask` printed the full local log trace (Loading weights, step-by-step agent reasoning, entity extraction) exactly as before this change — confirmed genuinely direct, not a false-negative fallback (a first attempt at this test accidentally reused a still-running server from the prior test, caught by the log output's absence, then re-verified clean after a proper `/shutdown`). With a server running, `cli.py ask` returned instantly with zero local log output while the *server's* terminal showed the full request trace — including, usefully, a real Groq 413 → Cerebras timeout → local Boromir fallback chain firing correctly inside the server process. **Phase 2 is now fully closed.**
 
 **Phase 3 — Ratatui TUI**
-- [ ] Rust `ratatui` frontend (confirmed 2026-07-26 as still the current standard, actively maintained, 20k+ stars), talking to the Olorin Server over Phase 2's plain synchronous interface
-- [ ] Rust side has zero knowledge of Chroma/Ollama/Groq/Crawl4AI — it only sends queries and renders responses, all real logic stays in Python
+- [x] Rust `ratatui` frontend -- SUBSTANTIALLY BUILT, far exceeding this line's original scope, across a full session (2026-07-29 through 2026-08-02). Real, live-verified functionality built in eight incremental steps -- see this session's `ENGINEERING_JOURNAL.md` entries and `olorin_tui/src/main.rs`'s own doc-comment history for the complete account. Talks to the Olorin Server over a NEW `POST /ask/stream` SSE interface (added this session, a deliberate reopening of Phase 2's own streaming deferral -- real TUI usage surfaced exactly the silent-hang problem that deferral said would justify revisiting it), not just Phase 2's original plain synchronous one.
+- [x] Rust side has zero knowledge of Chroma/Ollama/Groq/Crawl4AI — confirmed true after building it: `olorin_tui/src/main.rs`/`markdown.rs` only construct HTTP requests, parse JSON/SSE responses, and render. Every real decision (routing, indexing, tool calls) stays entirely server-side, exactly as designed.
 
 **Phase 4 — Tray as launcher, not a second interface.** This is the one place the fuller proposal's framing was kept: the system tray icon doesn't become its own UI, it launches the TUI (and later, a desktop GUI if one's ever built) — avoids maintaining two parallel interactive surfaces for no real reason. Supersedes the original standalone framing of this V4 item.
 - [ ] System tray icon (`pystray`) launches the TUI
@@ -1298,8 +1393,8 @@ redesigned around the next thing built on top of it.
 | Agent loop | Python, raw ReAct | Written from scratch, no framework |
 | LLM abstraction | `openai` SDK (Groq), native `ollama` SDK (local) | Ollama's `/v1` OpenAI-compat endpoint is unreliable for tool calling (experimental, confirmed via testing) — native `/api/chat` used instead. See Section 13. |
 | Cloud LLM | Groq `openai/gpt-oss-120b` (switched 2026-07-25, see Section 13) | Primary; slower per-call than `llama-3.3-70b-versatile` was (observed 20-25s on long final answers vs. sub-2s), traded for real tool-calling reliability |
-| Local LLM (code) | Ollama `boromir` (qwen3:8b, `think:false`) | 16K ctx, 100% GPU, native tool-calling |
-| Local LLM (reason) | Ollama `faramir` (deepseek-r1:8b) | 16K ctx, reasoning model |
+| Local LLM (code) | Ollama `local:latest` persona=Boromir (`FROM qwen3:8b`, `think:false`) | 16K ctx, 100% GPU, native tool-calling |
+| Local LLM (reason) | Ollama `local:latest` persona=Faramir (`FROM qwen3:8b`, `think:true`) | 16K ctx, reasoning mode — collapsed onto the same weights as Boromir 2026-07-20, see Section 2/13 |
 | Code parsing | `tree-sitter` Python bindings | AST-aware chunking |
 | PDF parsing | `pdfplumber` (V3, 2026-07-18) | Page-level text extraction for document ingestion; chosen over `pypdf` for layout quality |
 | Embeddings | `sentence-transformers` `bge-small-en-v1.5` | GPU (CUDA), ~130MB |
@@ -1880,6 +1975,30 @@ Safety layers built exactly as planned 2026-07-24, before any live test: a schem
 **Real bug #19 (informal numbering — first bug found in this integration): the first real crawl attempt (`https://example.com`) timed out at the full 30s instead of succeeding.** Traced to `crawler/config.py`'s `build_markdown_run_config()`, which waits for `document.querySelector('main')` to exist with real text before extracting anything — a good default for the documentation/article sites this library is designed around (its own docstring says so, and `MAIN_SELECTORS` targets `main`/`[role='main']`/`.docs-content`/etc.), but a hard gate, not a hint: `example.com`'s page has no `<main>` element at all, so the condition can structurally never become true. Confirmed by reading the actual wait condition in `config.py`, not guessed at from the timeout alone. **Fixed** with a narrow `RunConfigOverrides` (the library's own supported override mechanism, `crawl_page(url, config=...)`) swapping only the `wait_for` condition to a general "page has rendered real text" check (`document.body.innerText.trim().length > 50`) instead of requiring a specific tag — still waits out genuinely JS-heavy pages, just doesn't assume every page has semantic markup. Everything else from the library's default config (nav/footer/ad-selector exclusion, the markdown generator, dedup) is kept unmodified — a single-field override, not a rebuild. **Re-verified live:** the same URL that previously timed out now correctly returns `title="Example Domain"` and clean, correctly-extracted markdown content.
 
 **Verification status, updated same day — now FULLY closed.** The standalone smoke test (`python -m tools.crawl`) and `python -m tools.registry` were closed first, as logged above. **The real agent-loop test then ran clean:** `cli.py ask "Boromir, crawl https://example.com and tell me what the page says"` — step 1 correctly called `crawl_page({'url': 'https://example.com'})`; step 2 synthesized a correct final answer directly from the real returned markdown, no fabrication. The log is worth reading carefully rather than just checking it ran: two Faramir calls at the very start (31.2s + 14.2s) were routine index-on-demand capsule regeneration (2 capsules, logged at 51.2s total) triggered by 5 changed files, unrelated to `crawl_page` itself — same pattern already documented 2026-07-22. A third, trailing Ollama call after the final answer (`latency_ms=530`, empty query) is entity extraction firing correctly post-`finish_reason=="stop"`; no "committed" log line means it correctly found zero candidates worth remembering from this exchange, expected behavior, not a bug. This is the same live-verification bar every other tool in this project has been held to — genuinely closed, not smoke-tested-and-assumed. `search`/`crawl_site` (multi-page/site crawling) remain deliberately unbuilt — `crawl_page` (single page) was the actual scoped deliverable from the 2026-07-24 plan.
+
+**2026-07-27 — V5 Phases 0, 1, and 2 all closed, live-verified, in one session.** Picked up exactly where 2026-07-26's planning session left off.
+
+**Phase 0 (environment hygiene):** `requirements.txt` written, then corrected the same day — a first curated-direct-dependencies version was replaced with Aryavart's real `pip freeze` output after direct pushback that the roadmap item says "freeze the actual working environment" and a curated list trades away the actual reproducibility property the file exists for. Real bonus from the correction: the freeze captured `searxNcrawl`'s exact installed commit via a git+commit editable reference, more reproducible than the first version's own local-path comment. `setup.ps1` written, and its first real run caught two genuine bugs: an em-dash encoding issue that broke Windows PowerShell 5.1's parser outright (fixed by rewriting plain-ASCII, not by adding a BOM), and a Python-version mismatch — `python` on PATH now resolves to 3.14, different from the working venv's 3.11, which would have silently broken only `torch` (no 3.14 wheel exists for the pinned `2.5.1+cu121`) while ~250 other packages installed fine, an easy failure to misdiagnose. Fixed by preferring `py -3.11` via the Windows launcher. Re-run completed clean. Full pipeline then verified on both a throwaway dummy repo (first-time indexing, capsule generation, a grounded answer) and the real `olorin` repo itself (full multi-step ReAct loop, automatic reindex, entity extraction) under the new venv — confirmed a genuine drop-in replacement before `venv_old` was deleted. Phase 0's last item, a prebuilt `indexer_core` Windows binary, shipped as a GitHub Actions workflow (`indexer_core-v*` tag → build → SHA256 checksum → release) — first real run failed on GitHub's default read-only `GITHUB_TOKEN` ("Resource not accessible by integration"), fixed with an explicit `permissions: contents: write` block, re-run succeeded and published `indexer_core-v0.1.0`.
+
+**Phase 1 (repo/README track):** `README.md` rewritten with real prerequisites, a genuine quickstart (both `setup.ps1` and the manual walkthrough), and Section 14's recruiter pitch quoted directly — fixing the same `llama-3.3-70b-versatile`/separate-Boromir-Faramir staleness already caught in Sections 2/12/3/4 during this same pass (Section 3's storage estimate was genuinely wrong, not just stale wording — it double-counted a model that's one file on disk post-collapse, not two).
+
+**Phase 2 (Olorin Server):** `server/app.py` built — stdlib `http.server`, no new dependency (`fastapi` itself isn't actually installed despite `starlette`/`uvicorn` riding along as `mcp`/`fastmcp` transitive deps, checked before assuming otherwise). `POST /ask`, `GET /health`, `POST /shutdown`, bound to one primary repo at startup, wrapping `Agent.run()` completely unmodified per the design already locked in during planning. Verified live immediately: a real request ran the full index-on-demand → ReAct loop → entity extraction chain identically to `cli.py ask`, and shutdown exited the process cleanly. `cli.py ask` then migrated to prefer an already-running server when reachable and fall back to the existing direct path otherwise — deliberately not a hard requirement, since forcing every one-shot CLI call through a server would reintroduce the exact cold-start cost the server exists to remove. Verification here caught two real methodology near-misses before accepting the result: a duplicate-paste transcript that would have falsely confirmed the fallback path, and a leftover un-shut-down server from a prior test that let a "no server" test silently pass through it anyway — both caught by checking for the actual absence of expected local log output rather than trusting that an answer came back. The corrected re-test showed the full local trace with no server running, and, usefully, the server-routed test exercised a real Groq 413 → Cerebras timeout → local Boromir fallback chain along the way, not just a bare happy path.
+
+**Six real issues found and fixed this session**, on top of the ones already logged in prior V5 planning: the requirements.txt curation-vs-freeze correction, the `setup.ps1` encoding bug, the `setup.ps1` Python-version bug, the GitHub Actions permissions bug, and two test-methodology near-misses caught during server verification. Full session detail in `ENGINEERING_JOURNAL.md`'s 2026-07-27 entries. **V5 Phases 0, 1, and 2 are now fully closed — written, live-verified, and documented, not just planned.** Phase 3 (the Ratatui TUI, real Rust frontend work) is deliberately deferred to a fresh session rather than started here.
+
+**2026-07-29 through 2026-08-02 — V5 Phase 3 (Ratatui TUI) substantially built across one long session, real and live-verified at every step, plus real server-side additions along the way.** Full technical account lives in `ENGINEERING_JOURNAL.md`'s entries for this stretch and in `olorin_tui/src/main.rs`'s own doc-comment history (each of the 8 build steps documents itself); summarized here for the roadmap record.
+
+**The TUI itself (`olorin_tui/`, a new Rust crate):** built as eight incremental, independently-tested steps rather than one large change — (1) static ratatui shell, (2) real input + a fixed "Grey Pilgrim" color theme (exact hex palette from a supplied design reference, not terminal-dependent named colors) + locked cursor style, (3) real `POST /ask` networking, (4) responsiveness via `tokio::select!` (keyboard events raced against the pending request, so `Esc` works instantly even mid-request — proven live against a real 4-minute rate-limit-cascade request, not just a quick call), (5) a real append-only chat transcript with manual scrollback, (6) a from-scratch markdown renderer (`markdown.rs` — headers/bold/italic/bold-italic/inline-code/bullet-lists/real column-aligned tables/fenced-code-block detection, plus CommonMark's underscore-intraword-emphasis rule found necessary live when `finish_reason` lost its underscore to an over-eager italic parser), (7) the real multi-panel layout matching the supplied "Grey Pilgrim" mockup (Context/Tools/System Status/Indicators left sidebar; Chat with a multi-row wrapping+scrolling input pinned at the bottom; Activity/Context Window/Current Model right sidebar), (8) real live Activity streaming via a new server endpoint. Also added: full mouse support (scroll wheel, click-to-position-cursor — with the native-terminal-copy tradeoff explained and knowingly accepted, not glossed over), real terminal-style line editing (`Left`/`Right`/`Home`/`End`, UTF-8-correct cursor math via byte/char-index conversion), and a panic hook restoring the terminal (raw mode, alternate screen, mouse capture) before any panic message prints — added specifically after a real panic (a `tokio::select!` guard-evaluation misunderstanding, corrected the same session) actually left a terminal session visibly corrupted.
+
+**A real, deliberate scope expansion, not scope creep — worth being precise about why.** Phase 2's own text explicitly deferred streaming ("until real TUI usage shows the synchronous loading experience is actually a problem worth solving, not built preemptively against a guess"). Real TUI usage this session did exactly that: a genuine 60-second silent gap before the very first byte of a response arrived, traced precisely to index-on-demand/capsule regeneration running entirely before response headers were ever sent. `POST /ask/stream` (`server/app.py`) was added alongside — not replacing — the existing `/ask` (which `cli.py`'s `ask` command still uses, completely untouched): a temporary logging handler taps the SAME `"olorin"` root logger every submodule already logs through (`core/logging_config.py`, zero new instrumentation needed in `core/agent.py` itself), streaming each captured record to the client as an SSE event as it actually happens, ending with a final event carrying the real answer plus genuine backend/provider/model/complexity/token metadata. `core/agent.py` gained `Agent.last_backend_used`/`last_provider`/`last_model`/`last_complexity_score`/`last_input_tokens`/`last_output_tokens` — populated from data `Agent.run()` already computed internally for logging/entity-extraction, additive instance attributes rather than a return-type change, so `cli.py`'s existing `ask` command needed zero changes and carries zero risk from this.
+
+**Two real empirical lessons earned this session, not assumed — both matching this project's standing "verify, don't trust that something streams just because it's named that" discipline:** (a) a Python `requests`-based standalone test script (`test_stream_endpoint.py`, written specifically to verify streaming before writing any Rust to consume it) initially showed every event bunched at one client-side timestamp despite genuinely different server-side send times — traced to `iter_lines()`'s default internal buffering (chunk_size=512), not a server bug, fixed with `chunk_size=1`; re-verified afterward that every remaining gap matched its logged `latency_ms` almost to the millisecond. (b) Even after that fix, individual slow LLM calls still showed as one long silent gap — because the only log line for a slow call fired on COMPLETION, never on start. Closed by adding `"requesting from {provider}..."` log lines at the actual START of each provider call (`core/llm_client.py`, five call sites: forced-Groq, forced-Cerebras, auto-mode Groq, auto-mode Cerebras escalation, and `_call_local()` covering every local dispatch path at once). `reqwest`'s `bytes_stream()` was separately verified (not assumed) to read incrementally on the Rust-side consumer too.
+
+**Two real, unrelated Python bugs found and fixed mid-session, surfaced by actually using the TUI against the real repo rather than a toy one:** `indexer/store.py`'s `upsert_chunks()` had no batching against ChromaDB's own hard per-call item cap (`client.get_max_batch_size()`), crashing (`ValueError: Batch size of 17282 is greater than max batch size of 5461`) on a large reindex — fixed by slicing into sub-batches at the client's own real reported limit, not a hardcoded guess. The ACTUAL root cause of that specific crash, found by digging past the batching symptom: `.gitignore` was missing a general `target/` pattern (only `indexer_core/target/` was listed, not `olorin_tui/target/`, a brand-new crate created this session) — meaning the Rust walker had been indexing Cargo's entire compiled dependency tree as "code," 17,000+ garbage chunks from a single `.pdb` file alone. Fixed by generalizing the `.gitignore` pattern to `target/` (covers any current or future Rust crate), and the ChromaDB collection was deliberately wiped and rebuilt clean afterward rather than left with orphaned garbage chunks sitting alongside real indexed code.
+
+**Deliberately not yet done this session, honestly scoped rather than silently skipped:** responsive/adaptive layout for narrow terminals (sidebar widths are fixed); interactive scrolling within the Tools panel if that list ever grows past its fixed height (currently truncation-safe via a "+N more" line, not yet browsable — no key/mouse binding assigned to it); a cosmetic typing/reveal effect for how responses appear on screen (explicitly deferred to a dedicated design pass early in the session, a deliberate decision, not an oversight); `tachyonfx` (mentioned early on as something to look into, never actually researched this session); a System Health panel (present in the supplied mockup, not reached — Context Window/Current Model/System Status were the three explicitly requested and built this session). Also noted but not acted on: `build.nvidia.com`'s NIM API catalog as a real, currently-free (verified via live search, not assumed from training data), OpenAI-compatible fourth cloud-provider candidate — genuinely well-suited to this project's specific recurring pain (Groq's tight per-request token cap, not request-count), scoped as a real next Python-side task (`providers/nim_provider.py`, mirroring `cerebras_provider.py`) rather than started this session.
+
+**Verification bar held throughout, same as every other feature in this project:** every one of the 8 TUI steps, both server-side streaming fixes, and both Python bugs were confirmed against real `cargo run`/live-request output — screenshots and pasted terminal transcripts reviewed at each step — not accepted on the strength of the diff alone. `README.md`/Section 14's recruiter pitch have NOT yet been updated to mention the TUI — a real, correctly-flagged next-session item, not forgotten.
 
 ---
 

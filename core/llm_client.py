@@ -304,6 +304,13 @@ class LLMClient:
         effective_think = (
             think_override if think_override is not None else self._PERSONA_THINK[persona]
         )
+        # Logged BEFORE the call, not just after (response = ... below
+        # already logs latency/provider on completion, via chat()) --
+        # added specifically so a slow local call shows up as "in
+        # progress" to anything watching the log stream in real time
+        # (server/app.py's /ask/stream), rather than only becoming
+        # visible once it's already finished.
+        logger.info(f"requesting from {persona} (local)...")
         response = self.local.chat(
             messages, tools=tools, think_override=effective_think,
             options_override=self._PERSONA_PARAMS[persona],
@@ -502,6 +509,7 @@ class LLMClient:
             # normal ProviderError and fall back the same way any other
             # Cerebras failure would.
             try:
+                logger.info("requesting from cerebras...")
                 return self.cerebras.chat(messages, tools=tools, think_override=think_override)
             except ProviderError as e:
                 fallback_persona = local_persona_hint or select_local_specialist(query)
@@ -525,6 +533,7 @@ class LLMClient:
             # auto-mode fallback below exactly, rather than inventing a
             # second fallback policy.
             try:
+                logger.info("requesting from groq...")
                 return self.groq.chat(messages, tools=tools, think_override=think_override)
             except ProviderError as e:
                 fallback_persona = local_persona_hint or select_local_specialist(query)
@@ -545,6 +554,7 @@ class LLMClient:
 
         if should_try_groq and not self._groq_circuit_open():
             try:
+                logger.info("requesting from groq...")
                 response = self.groq.chat(messages, tools=tools, think_override=think_override)
                 # Attach the score that drove this decision — set here,
                 # not inside GroqProvider, since providers have no
@@ -580,6 +590,7 @@ class LLMClient:
             and not self._cerebras_circuit_open()
         ):
             try:
+                logger.info("requesting from cerebras...")
                 response = self.cerebras.chat(messages, tools=tools, think_override=think_override)
                 response.complexity_score = score
                 logger.info("Escalated to Cerebras after Groq unavailable/failed")
