@@ -69,6 +69,58 @@ _INDEXER_BINARY = os.path.join(
 )
 
 
+# Matches server/app.py's own default (--port). Duplicated as a literal
+# here rather than imported, since server/app.py imports _index_repo
+# from this module -- importing back from server.app at module load
+# time would be circular. See _try_server_ask()'s docstring.
+_SERVER_PORT = 8756
+
+
+def _try_server_ask(payload: dict, timeout: float = 0.3) -> dict | None:
+    """
+    Checks for an already-running Olorin Server (server/app.py, V5 Phase
+    2) on localhost and, if reachable, routes the request through it
+    instead of building a fresh in-process Agent. Returns None -- not an
+    error dict -- on any connection failure, so the caller falls back to
+    the existing direct path unchanged. This must never turn "no server
+    running" (the overwhelmingly common case for a one-shot `ask` call)
+    into a visible error; the server is an opportunistic fast path, not
+    a requirement.
+
+    Deferred stdlib import (urllib), matching this module's existing
+    pattern of not paying for anything an --help or non-server call
+    doesn't need.
+    """
+    import urllib.error
+    import urllib.request
+
+    try:
+        health_req = urllib.request.Request(f"http://127.0.0.1:{_SERVER_PORT}/health")
+        with urllib.request.urlopen(health_req, timeout=timeout) as resp:
+            health = json.loads(resp.read())
+        if health.get("status") != "ok":
+            return None
+    except (urllib.error.URLError, OSError, TimeoutError, json.JSONDecodeError):
+        return None
+
+    try:
+        body = json.dumps(payload).encode("utf-8")
+        ask_req = urllib.request.Request(
+            f"http://127.0.0.1:{_SERVER_PORT}/ask",
+            data=body,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        # Generous timeout here, deliberately unlike the 0.3s health
+        # check above -- a real query (indexing + ReAct loop) can
+        # legitimately take tens of seconds, per this project's own
+        # measured latencies (Section 13).
+        with urllib.request.urlopen(ask_req, timeout=300) as resp:
+            return json.loads(resp.read())
+    except (urllib.error.URLError, OSError, TimeoutError, json.JSONDecodeError):
+        return None
+
+
 def _run_walker(repo_path: str) -> list[dict]:
     """
     Invokes the Rust file walker as a subprocess and parses its JSON
@@ -363,11 +415,25 @@ def ask(
         False, "--skip-index",
         help="Skip the automatic index-freshness check (advanced; answers may be stale or ungrounded).",
     ),
+    no_server: bool = typer.Option(
+        False, "--no-server",
+        help="Always use the direct in-process path, even if an Olorin Server is running (V5 Phase 2).",
+    ),
 ):
     """
     Ask Olorin a question about a repo. Thin wrapper around the already-
     proven Agent.run() (core/agent.py) — per Section 7's CLI flags and
     Section 9's ReAct loop.
+
+    Prefers an already-running Olorin Server (server/app.py, V5 Phase 2)
+    if one's reachable on localhost, routing the request through it
+    instead of building a fresh in-process Agent — avoids the ~6-10s
+    cold-start tax on every call when a server happens to already be up.
+    Falls back silently to the direct path below if no server is
+    running, which is the common case and behaves identically to before
+    this existed. --no-server forces the direct path explicitly;
+    --profile does the same implicitly, since it measures this process's
+    own cost, not a server's.
 
     Runs the indexing pipeline (_index_repo()) as an automatic precondition
     before answering, unless --skip-index is passed. This replaced an
@@ -466,6 +532,34 @@ def ask(
                 typer.secho(f"Not a directory: {abs_r}", fg=typer.colors.RED)
                 raise typer.Exit(code=1)
             extra_repo_paths.append(abs_r)
+
+    # Olorin Server fast path (V5 Phase 2, OLORIN_PROJECT.md Section 11)
+    # -- opportunistic, not required. If a server happens to already be
+    # running (e.g. launched for a TUI session, or manually for a batch
+    # of queries), route through it instead of building a fresh
+    # in-process Agent, avoiding the ~6-10s cold-start tax measured back
+    # in V1.5. Falls through silently to the existing direct path below
+    # if no server is reachable -- the overwhelmingly common case for a
+    # one-shot `ask` call, and unchanged from before this existed.
+    # --profile forces the direct path regardless: profiling measures
+    # THIS process's own cost, and a server-routed call would only
+    # measure the HTTP round-trip, not the real work happening in the
+    # other process.
+    if not no_server and not profile:
+        server_result = _try_server_ask({
+            "query": query,
+            "path": repo_path,
+            "repos": repos,
+            "provider": provider,
+            "force_local": force_local,
+            "skip_index": skip_index,
+        })
+        if server_result is not None:
+            if "error" in server_result:
+                typer.secho(f"Server error: {server_result['error']}", fg=typer.colors.RED)
+                raise typer.Exit(code=1)
+            typer.echo(server_result["answer"])
+            return
 
     if not skip_index:
         from indexer.store import get_collection

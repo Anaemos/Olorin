@@ -5,5 +5,5 @@ venv/
 .venv/
 *.db
 chroma_db/
-indexer_core/target/
+target/
 logs/
